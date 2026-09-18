@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {wrapShellCommand} from '../mods/shell-encoding';
+import {wrapShellCommand} from '../mods/lib/shell';
 
 const WIN = {windows: true};
 const OTHER_OS = {windows: false};

@@ -26,6 +26,8 @@ declare module '@commandcode/harness' {
 	export interface AgentEvent {
 		readonly type: string;
 		readonly model?: string;
+		/** `run_start`：本会话 id。用来给落盘目录分桶，跨会话互不覆盖。 */
+		readonly sessionId?: string;
 		readonly usage?: TokenUsage;
 		/** `compaction_done`：本次压缩省下的 token（自动压缩只在 >0 时带）。 */
 		readonly tokensSaved?: number;
@@ -40,6 +42,8 @@ declare module '@commandcode/harness' {
 
 	export interface ModUi {
 		setStatus(text: string | null): void;
+		/** 往 notice 流里加一行。长输入被转成文件引用时用它告知用户。 */
+		notify(message: string, level?: 'info' | 'warning' | 'error'): void;
 	}
 
 	/** `beforeToolCall` 收到的这一次工具调用。 */
@@ -58,10 +62,61 @@ declare module '@commandcode/harness' {
 		readonly terminate?: boolean;
 	}
 
+	/** `afterToolCall` 收到的这一次工具调用（执行之后）。 */
+	export interface ModAfterToolCall {
+		readonly toolCallId: string;
+		readonly toolName: string;
+		/** 工具**实际执行**用的入参（已经过 beforeToolCall 改写）。 */
+		readonly input: Record<string, unknown>;
+		/**
+		 * 工具结果。形状不统一：可能是纯字符串，也可能是 content block 数组。
+		 * 所以处理前必须先探测形状，认不出来就原样放行（fail-open）。
+		 */
+		readonly result: unknown;
+		/** 工具自身执行是否失败（在任何 hook 覆写之前）。 */
+		readonly isError: boolean;
+		readonly state: unknown;
+	}
+
+	export interface ModAfterToolCallResult {
+		/** 整体替换模型看到的工具结果；形状应与 result 一致。 */
+		readonly content?: unknown;
+		readonly isError?: boolean;
+		readonly terminate?: boolean;
+		readonly additionalContext?: string;
+		readonly modState?: Record<string, unknown>;
+	}
+
+	export interface TransformInputPayload {
+		readonly text: string;
+	}
+
+	/** `transformInput` 的返回：改写 / 吞掉 / 放行。 */
+	export type TransformInputResult =
+		| {readonly action: 'continue'}
+		| {readonly action: 'transform'; readonly text: string}
+		| {readonly action: 'handled'; readonly message?: string};
+
+	export interface TransformContextPayload {
+		/** 本轮的完整消息列表。结果是**临时的**，不会写回 state.messages。 */
+		readonly messages: readonly unknown[];
+		readonly state?: unknown;
+	}
+
 	export interface ModHooks {
 		beforeToolCall?(
 			call: ModToolCall,
 		): BeforeToolCallResult | undefined | Promise<BeforeToolCallResult | undefined>;
+		afterToolCall?(
+			call: ModAfterToolCall,
+		): ModAfterToolCallResult | undefined | Promise<ModAfterToolCallResult | undefined>;
+		transformInput?(
+			input: TransformInputPayload,
+		): TransformInputResult | undefined | Promise<TransformInputResult | undefined>;
+		/** 每轮模型调用前改写上下文。返回**同一引用**表示没改动。 */
+		transformContext?(
+			payload: TransformContextPayload,
+		): readonly unknown[] | Promise<readonly unknown[]>;
 	}
 
 	export interface ModApi {

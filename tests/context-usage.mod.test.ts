@@ -129,7 +129,7 @@ describe('contextUsageMod 接线', () => {
 });
 
 describe('contextUsageMod 的缓存段接线', () => {
-	it('按 cacheRead/inputTokens 显示命中率', () => {
+	it('首次请求时累计命中率等于该次命中率', () => {
 		const cmd = fakeCmd();
 		contextUsageMod(cmd as never);
 		cmd.emit('model_request_end', {
@@ -137,6 +137,39 @@ describe('contextUsageMod 的缓存段接线', () => {
 			usage: {inputTokens: 20_000, cacheReadTokens: 18_000, outputTokens: 100},
 		});
 		expect(cmd.last()).toContain('cache 90%');
+	});
+
+	it('命中率是会话累计，而不是最近一次', () => {
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		// 第 1 轮命中 90%
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 20_000, cacheReadTokens: 18_000},
+		});
+		expect(cmd.last()).toContain('cache 90%');
+		// 第 2 轮只命中 5%（缓存被打断）
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 20_000, cacheReadTokens: 1_000}});
+		// 累计 = (18000 + 1000) / (20000 + 20000) = 47.5% -> 48%，绝不能显示成单次的 5%
+		expect(cmd.last()).toContain('cache 48%');
+		expect(cmd.last()).not.toContain('cache 5%');
+	});
+
+	it('单次恒为 99% 时，累计仍能反映早期的冷启动代价（实测数据）', () => {
+		// 真机观测：第 1 轮 47.9%，之后每轮单次都恒为 99%，单次数字毫无信息量。
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 17_907, cacheReadTokens: 8_576},
+		});
+		expect(cmd.last()).toContain('cache 48%');
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 18_223, cacheReadTokens: 18_048},
+		});
+		// 累计 = 26624 / 36130 = 73.7% -> 74%（单次是 99%）
+		expect(cmd.last()).toContain('cache 74%');
 	});
 
 	it('cacheWrite 有值时才附上写入量', () => {
@@ -149,11 +182,39 @@ describe('contextUsageMod 的缓存段接线', () => {
 		expect(cmd.last()).toContain('cache 40% +6k');
 	});
 
-	it('完全没有缓存活动时不显示 cache 段', () => {
+	it('写入量同样是累计', () => {
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 10_000, cacheReadTokens: 4_000, cacheWriteTokens: 6_000},
+		});
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 10_000, cacheReadTokens: 6_000, cacheWriteTokens: 4_000},
+		});
+		// 累计写入 6k + 4k = 10k
+		expect(cmd.last()).toContain('+10k');
+	});
+
+	it('本会话从未有过缓存活动时不显示 cache 段', () => {
 		const cmd = fakeCmd();
 		contextUsageMod(cmd as never);
 		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000, outputTokens: 5}});
 		expect(cmd.last()).not.toContain('cache');
+	});
+
+	it('某轮没有缓存活动，但本会话有过时仍显示累计值', () => {
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 10_000, cacheReadTokens: 9_000},
+		});
+		// 这一轮完全没有缓存活动
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000}});
+		// 累计仍是 9000/20000 = 45%
+		expect(cmd.last()).toContain('cache 45%');
 	});
 
 	it('子代理请求里的缓存活动不覆盖主上下文', () => {
@@ -181,6 +242,23 @@ describe('contextUsageMod 的缓存段接线', () => {
 		expect(cmd.last()).toContain('cache');
 		cmd.emit('session_start');
 		expect(cmd.last()).not.toContain('cache');
+	});
+
+	it('session_start 后累计从零重新开始', () => {
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 20_000, cacheReadTokens: 2_000},
+		});
+		expect(cmd.last()).toContain('cache 10%');
+		cmd.emit('session_start');
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 20_000, cacheReadTokens: 18_000},
+		});
+		// 若累计没清零，这里会是 (2000+18000)/(20000+20000) = 50%
+		expect(cmd.last()).toContain('cache 90%');
 	});
 
 	it('缓存段排在压缩段之前', () => {

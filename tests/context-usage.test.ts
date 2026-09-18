@@ -1,16 +1,18 @@
 import {describe, expect, it} from 'vitest';
 import {
 	DEFAULT_CONTEXT_LIMIT,
-	barWidthFor,
-	buildBar,
 	expandModelKeys,
-	formatDuration,
-	formatTokens,
 	parseCatalogLimits,
 	parseConfigModel,
 	parseProviderLimits,
-	renderStatus,
 	resolveLimit,
+} from '../mods/lib/model-catalog';
+import {
+	barWidthFor,
+	buildBar,
+	formatDuration,
+	formatTokens,
+	renderStatus,
 } from '../mods/context-usage';
 
 const RED = '\u001b[31m';
@@ -176,7 +178,7 @@ describe('renderStatus', () => {
 describe('renderStatus 的缓存段', () => {
 	const base = {used: 50_000, limit: 100_000, estimated: false, columns: 120};
 
-	it('把 cacheRead 占输入的比例显示成命中率', () => {
+	it('把会话累计命中率显示成百分比', () => {
 		const text = renderStatus({...base, cache: {hitRate: 0.98, written: 0}});
 		expect(text).toContain('cache 98%');
 	});

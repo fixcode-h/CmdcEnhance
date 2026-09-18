@@ -3,7 +3,8 @@
 // 两条来自 CLI 实现的硬约束（不是取舍）：
 //  - 输入框附近唯一真正渲染的挂点是 ui.setStatus。ui.widget 目前是空壳，不渲染任何东西。
 //  - 没有任何 API 能读到「当前模型」或「上下文上限」。模型只能从 model_request_* 事件里抓；
-//    上限由本文件自己解析：--mod-option → providers.json → models.dev 缓存 → 兜底 200k。
+//    上限由 lib/model-catalog 解析：--mod-option → providers.json → models.dev 缓存 → 兜底 200k。
+//    （context-slim 用同一个模块，两处必须得出同一个上限。）
 //
 // 占用口径 = inputTokens + outputTokens。CLI 的 inputTokens 已是整段 prompt 的总数
 // （cacheReadTokens 只是它的子集明细，不能相加），outputTokens 下一轮会进入 prompt。
@@ -11,18 +12,14 @@
 // 会话累计（↑/↓）是另一个维度的数：把每轮的 inputTokens/outputTokens 累加，
 // 衡量「本会话一共处理了多少 token」，不是上下文长度——每轮都会把整段 prompt 重发一遍。
 
-import {readFileSync} from 'node:fs';
-import {homedir} from 'node:os';
-import {join} from 'node:path';
 import type {ModApi} from '@commandcode/harness';
-
-const CONFIG_DIR = join(homedir(), '.commandcode');
-const CATALOG_PATH = join(CONFIG_DIR, 'cache', 'models-dev.json');
-const PROVIDERS_PATH = join(CONFIG_DIR, 'providers.json');
-const CONFIG_PATH = join(CONFIG_DIR, 'config.json');
-
-/** 与 CLI 自身的兜底值一致（内部常量 xr）。 */
-export const DEFAULT_CONTEXT_LIMIT = 200_000;
+import {
+	asPositiveNumber,
+	loadCatalogLimits,
+	loadConfigModel,
+	loadProviderLimits,
+	resolveLimit,
+} from './lib/model-catalog';
 
 const ANSI = {
 	reset: '\u001b[0m',
@@ -32,13 +29,6 @@ const ANSI = {
 	red: '\u001b[31m',
 };
 
-export type LimitSource = 'option' | 'provider' | 'catalog' | 'default';
-
-export interface LimitResolution {
-	readonly limit: number;
-	readonly source: LimitSource;
-}
-
 /** 最近一次上下文压缩（自动或 /compact）的摘要。 */
 export interface CompactionInfo {
 	/** 距该次压缩过去的毫秒数。 */
@@ -47,11 +37,19 @@ export interface CompactionInfo {
 	readonly saved: number;
 }
 
-/** 最近一次请求的 prompt 缓存情况。 */
+/**
+ * 本会话累计的 prompt 缓存情况，每完成一次请求累加，`session_start` 清零。
+ *
+ * **为什么用累计而不是最近一次**（实测）：单次命中率从第 2 轮起就恒为 99~100%
+ * ——每轮只是把上一轮的 prompt 再发一遍，本来就几乎全命中，这个数字没有信息量
+ * （实测 5 轮：47.9% → 99.0% → 99.0% → 99.0% → 99.0%）。累计值才有意义，
+ * 它把会话早期的冷启动代价摊进来，如实反映整体缓存健康度（同 5 轮：47.9% → 89.0%）。
+ * 而且它与紧邻的 ↑/↓ 段同为会话累计，尺度一致。
+ */
 export interface CacheInfo {
-	/** 缓存读取占本次输入的比例（0-1），即命中率。 */
+	/** 累计缓存读取占累计输入的比例（0-1），即会话命中率。 */
 	readonly hitRate: number;
-	/** 本次写入缓存的 token；<=0 表示没写，不显示。 */
+	/** 累计写入缓存的 token；<=0 表示没写过，不显示。 */
 	readonly written: number;
 }
 
@@ -136,9 +134,10 @@ function renderCompaction(info: CompactionInfo): string {
 	return ` ${ANSI.dim}· ⟳ ${formatDuration(info.ageMs)}${saved}${ANSI.reset}`;
 }
 
+/** 会话累计的缓存命中率与写入量（两者都是整个对话的累计，与左边的 ↑/↓ 同尺度）。 */
 function renderCache(info: CacheInfo): string {
 	const percent = `${Math.round(info.hitRate * 100)}%`;
-	// 写入量只在真有写入时出现；它和命中率是一对：高写入压低命中率，但会摊到后续轮次。
+	// 累计写入量：只在本会话真写过缓存时出现。
 	const written = info.written > 0 ? ` +${formatTokens(info.written)}` : '';
 	return ` ${ANSI.dim}· cache ${percent}${written}${ANSI.reset}`;
 }
@@ -166,141 +165,6 @@ export function renderStatus(input: StatusInput): string {
 	);
 }
 
-/**
- * 模型 id 的候选查表键，按优先级：完整 id 优先于裸名，避免跨 provider 撞名。
- * 对应 CLI 的 canonicalizeModelId：去 `:effort` 后缀、去 `-YYYYMMDD` 日期后缀。
- */
-export function expandModelKeys(model: string): string[] {
-	const keys: string[] = [];
-	const add = (value: string | undefined): void => {
-		if (!value) return;
-		const key = value.trim().toLowerCase();
-		if (key && !keys.includes(key)) keys.push(key);
-	};
-	const raw = model.trim();
-	const forms = [raw, raw.replace(/[:#].*$/, '')];
-	for (const form of forms) add(form);
-	for (const form of forms) add(form.replace(/[-@]\d{8}$/, ''));
-	for (const key of [...keys]) add(key.split('/').pop());
-	return keys;
-}
-
-function asPositiveNumber(value: unknown): number | undefined {
-	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-export function resolveLimit(input: {
-	readonly model: string;
-	readonly override?: number;
-	readonly providerLimits: ReadonlyMap<string, number>;
-	readonly catalogLimits: ReadonlyMap<string, number>;
-}): LimitResolution {
-	if (asPositiveNumber(input.override)) {
-		return {limit: input.override as number, source: 'option'};
-	}
-	const keys = expandModelKeys(input.model);
-	for (const key of keys) {
-		const hit = input.providerLimits.get(key);
-		if (hit) return {limit: hit, source: 'provider'};
-	}
-	// 目录里裸名会撞车：`acme/mystery-1` 的裸名 `mystery-1` 可能命中别家同名模型。
-	// 带前缀的 id 只认全名匹配，查不到宁可回落到估算值，也不谎报一个别人的窗口。
-	const allowBare = !input.model.includes('/');
-	for (const key of keys) {
-		if (!allowBare && !key.includes('/')) continue;
-		const hit = input.catalogLimits.get(key);
-		if (hit) return {limit: hit, source: 'catalog'};
-	}
-	return {limit: DEFAULT_CONTEXT_LIMIT, source: 'default'};
-}
-
-function readJson(path: string): unknown {
-	try {
-		return JSON.parse(readFileSync(path, 'utf8'));
-	} catch {
-		return undefined;
-	}
-}
-
-function indexLimit(map: Map<string, number>, key: string, limit: number, bareAlso: boolean): void {
-	const lower = key.trim().toLowerCase();
-	if (!lower) return;
-	if (!map.has(lower)) map.set(lower, limit);
-	if (!bareAlso) return;
-	const bare = lower.split('/').pop();
-	if (bare && bare !== lower && !map.has(bare)) map.set(bare, limit);
-}
-
-export interface CatalogFile {
-	readonly data?: Record<string, {models?: Record<string, {limit?: {context?: unknown}}>}>;
-}
-
-export interface ProvidersFile {
-	readonly provider?: Record<string, ProviderEntry>;
-	readonly providers?: Record<string, ProviderEntry>;
-}
-
-/** `~/.commandcode/config.json` 里记住的上次使用的模型。 */
-export interface ConfigFile {
-	readonly model?: unknown;
-}
-
-interface ProviderEntry {
-	readonly models?: Record<string, {contextWindow?: unknown; limit?: {context?: unknown}} | null>;
-}
-
-export function parseCatalogLimits(root: CatalogFile | undefined): Map<string, number> {
-	const out = new Map<string, number>();
-	for (const provider of Object.values(root?.data ?? {})) {
-		for (const [modelId, model] of Object.entries(provider?.models ?? {})) {
-			const limit = asPositiveNumber(model?.limit?.context);
-			if (limit) indexLimit(out, modelId, limit, true);
-		}
-	}
-	return out;
-}
-
-/** BYOK 自定义 provider 在 providers.json 里声明的 contextWindow（或 limit.context）。 */
-export function parseProviderLimits(root: ProvidersFile | undefined): Map<string, number> {
-	const out = new Map<string, number>();
-	for (const group of ['provider', 'providers'] as const) {
-		for (const [providerId, provider] of Object.entries(root?.[group] ?? {})) {
-			for (const [modelId, entry] of Object.entries(provider?.models ?? {})) {
-				const limit =
-					asPositiveNumber(entry?.contextWindow) ?? asPositiveNumber(entry?.limit?.context);
-				if (!limit) continue;
-				indexLimit(out, modelId, limit, false);
-				indexLimit(out, `${providerId}/${modelId}`, limit, false);
-			}
-		}
-	}
-	return out;
-}
-
-export function loadProviderLimits(): Map<string, number> {
-	return parseProviderLimits(readJson(PROVIDERS_PATH) as ProvidersFile | undefined);
-}
-
-let catalogCache: Map<string, number> | undefined;
-
-/** models.dev 目录缓存（4.7MB），首次查表时才解析。 */
-export function loadCatalogLimits(): Map<string, number> {
-	catalogCache ??= parseCatalogLimits(readJson(CATALOG_PATH) as CatalogFile | undefined);
-	return catalogCache;
-}
-
-/**
- * config.json 里的模型名。CLI 启动到第一次 model_request_start 之间是事件静默期，
- * 这段时间只有这里能拿到模型，否则首屏必然落到兜底的 ~200k。
- */
-export function parseConfigModel(root: ConfigFile | undefined): string {
-	return typeof root?.model === 'string' ? root.model.trim() : '';
-}
-
-export function loadConfigModel(): string {
-	return parseConfigModel(readJson(CONFIG_PATH) as ConfigFile | undefined);
-}
-
 export default function contextUsageMod(cmd: ModApi): void {
 	cmd.addFlag('contextWindow', {
 		type: 'string',
@@ -309,15 +173,16 @@ export default function contextUsageMod(cmd: ModApi): void {
 
 	// 首屏在第一次 model_request_start 之前，事件还给不出模型，先用 config.json 的兜底。
 	let model = loadConfigModel();
+	// 当前上下文长度（最近一轮请求的 input + output）。
 	let used = 0;
-	// 最近一次请求的 prompt 构成：input 是总数，cacheRead / cacheWrite 都是它的子集。
-	let promptTokens = 0;
-	let cacheReadTokens = 0;
-	let cacheWriteTokens = 0;
 	// 本会话累计（只算主上下文，不含子代理）。每轮请求都会把整段 prompt 重发一遍，
 	// 所以 input 会随轮次快速增长——它衡量的是「一共处理了多少 token」，不是上下文长度。
 	let sessionInput = 0;
 	let sessionOutput = 0;
+	// 缓存也按会话累计：单次命中率恒为 99% 没有信息量，累计才有（详见 CacheInfo 注释）。
+	// input 已含 cacheRead / cacheWrite，所以它们是 input 的子集明细，不能相加。
+	let sessionCacheRead = 0;
+	let sessionCacheWrite = 0;
 	// 子代理的请求也走 model_request_end；凭它更新会跳到子上下文长度，用深度计数挡掉。
 	let subagentDepth = 0;
 	let painted = '';
@@ -330,13 +195,16 @@ export default function contextUsageMod(cmd: ModApi): void {
 	const override = (): number | undefined => asPositiveNumber(Number(cmd.getFlag('contextWindow')));
 
 	/**
-	 * 缓存段只在这次请求真有缓存活动时出现：完全不支持 prompt 缓存的 provider
-	 * 两项恒为 0，硬画一个 `cache 0%` 只是噪音。
+	 * 会话累计口径。只在**本会话真有过**缓存活动时出现：完全不支持 prompt 缓存的
+	 * provider 两项恒为 0，硬画一个 `cache 0%` 只是噪音。
 	 */
 	const cacheInfo = (): CacheInfo | undefined => {
-		if (promptTokens <= 0) return undefined;
-		if (cacheReadTokens <= 0 && cacheWriteTokens <= 0) return undefined;
-		return {hitRate: Math.min(1, cacheReadTokens / promptTokens), written: cacheWriteTokens};
+		if (sessionInput <= 0) return undefined;
+		if (sessionCacheRead <= 0 && sessionCacheWrite <= 0) return undefined;
+		return {
+			hitRate: Math.min(1, sessionCacheRead / sessionInput),
+			written: sessionCacheWrite,
+		};
 	};
 
 	/** 首次请求之前两个都是 0，画出来只是噪音，等有数了再出现。 */
@@ -392,12 +260,16 @@ export default function contextUsageMod(cmd: ModApi): void {
 		if (subagentDepth > 0) return;
 		if (typeof event.model === 'string' && event.model) model = event.model;
 		const usage = event.usage;
-		promptTokens = usage?.inputTokens ?? 0;
-		cacheReadTokens = usage?.cacheReadTokens ?? 0;
-		cacheWriteTokens = usage?.cacheWriteTokens ?? 0;
-		used = promptTokens + (usage?.outputTokens ?? 0);
-		sessionInput += promptTokens;
-		sessionOutput += usage?.outputTokens ?? 0;
+		const input = usage?.inputTokens ?? 0;
+		const output = usage?.outputTokens ?? 0;
+		// 当前上下文长度 = 本轮 prompt 总数 + 本轮输出（下一轮它会进入 prompt）。
+		used = input + output;
+		// 会话累计。input 已含缓存读写的部分，所以缓存两项只作为明细单独累加，
+		// 不能并进 input（否则重复计数）。
+		sessionInput += input;
+		sessionOutput += output;
+		sessionCacheRead += usage?.cacheReadTokens ?? 0;
+		sessionCacheWrite += usage?.cacheWriteTokens ?? 0;
 		paint();
 	});
 
@@ -411,11 +283,10 @@ export default function contextUsageMod(cmd: ModApi): void {
 
 	cmd.on('session_start', () => {
 		used = 0;
-		promptTokens = 0;
-		cacheReadTokens = 0;
-		cacheWriteTokens = 0;
 		sessionInput = 0;
 		sessionOutput = 0;
+		sessionCacheRead = 0;
+		sessionCacheWrite = 0;
 		subagentDepth = 0;
 		compactionAt = undefined;
 		compactionSaved = 0;
