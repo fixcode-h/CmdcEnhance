@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+*.log
+*.tsbuildinfo
+
+# 本机个人状态（taste 学习结果、本地 mod/settings），不入库
+.commandcode/
