@@ -78,8 +78,11 @@ function textOfBlock(message: unknown): string {
 	return block?.content?.[0]?.text ?? '';
 }
 
-/** 让最后一次真实 usage 达标（上下文上限固定成 100k，便于计算）。 */
-const LIMIT_FLAG = {contextWindow: '100000'};
+/**
+ * 让最后一次真实 usage 达标（上下文上限固定成 100k，便于计算）。
+ * `contextSlim` 现在**默认关闭**，而这些用例验的是开启后的行为，所以显式打开。
+ */
+const LIMIT_FLAG = {contextWindow: '100000', contextSlim: true};
 
 describe('contextSlimMod 的触发判定', () => {
 	it('未达阈值时原样返回（同一引用）', () => {
@@ -108,6 +111,16 @@ describe('contextSlimMod 的触发判定', () => {
 		contextSlimMod(cmd as never);
 		const messages = buildMessages();
 		expect(cmd.transform(messages)).toBe(messages);
+	});
+
+	it('未设置开关时默认关闭（原样返回、不发通知）', () => {
+		const cmd = fakeCmd({cwd: tempDir(), flags: {contextWindow: '100000'}});
+		contextSlimMod(cmd as never);
+		cmd.emit('run_start', {sessionId: 's'});
+		cmd.emit('model_request_end', {usage: {inputTokens: 90_000}});
+		const messages = buildMessages();
+		expect(cmd.transform(messages)).toBe(messages);
+		expect(cmd.notifications).toHaveLength(0);
 	});
 
 	it('contextSlim=false 时完全不介入', () => {

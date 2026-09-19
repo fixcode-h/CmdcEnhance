@@ -294,11 +294,14 @@ export default function contextUsageMod(cmd: ModApi): void {
 		paint();
 	});
 
-	// 记下这次压缩省了多少，并让状态栏按秒刷新「距现在多久」；
-	// 压缩后下一轮请求会带回新的（更小的）用量。
+	// 记下这次压缩省了多少，并让状态栏按秒刷新「距现在多久」。
+	// 事件只带省下的量（`tokensSaved`），**不带**压缩后的真实用量，所以这里先按它
+	// 把占用扣下去——进度条立刻回落，不用干等下一轮请求。这是估算：下一轮
+	// `model_request_end` 会带回真实用量并覆盖它。
 	cmd.on('compaction_done', event => {
 		compactionAt = Date.now();
 		compactionSaved = typeof event.tokensSaved === 'number' ? event.tokensSaved : 0;
+		if (compactionSaved > 0) used = Math.max(0, used - compactionSaved);
 		startTicker();
 		paint();
 	});

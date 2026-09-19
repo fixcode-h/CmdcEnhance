@@ -78,14 +78,36 @@ describe('contextUsageMod 接线', () => {
 		expect(cmd.frames).toHaveLength(before);
 	});
 
-	it('压缩后在末尾追加时长与省下的 token', () => {
+	it('压缩后立刻按省下的量回落占用，不等下一轮请求', () => {
 		vi.useFakeTimers();
-		const cmd = fakeCmd();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 50_000}});
+		expect(cmd.last()).toContain('50k/1M');
+		// 事件只带 tokensSaved，占用先按 50k - 30k 回落。
+		cmd.emit('compaction_done', {tokensSaved: 30_000});
+		expect(cmd.last()).toContain('20k/1M');
+		expect(cmd.last()).toContain('⟳ 0s -30k');
+	});
+
+	it('压缩后的估算是暂时的，下一轮请求用真实用量覆盖', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
 		contextUsageMod(cmd as never);
 		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 50_000}});
 		cmd.emit('compaction_done', {tokensSaved: 30_000});
-		expect(cmd.last()).toContain('50k/');
-		expect(cmd.last()).toContain('⟳ 0s -30k');
+		expect(cmd.last()).toContain('20k/1M');
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 18_000}});
+		expect(cmd.last()).toContain('18k/1M');
+	});
+
+	it('压缩事件没带 tokensSaved 时不动占用', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 50_000}});
+		cmd.emit('compaction_done');
+		expect(cmd.last()).toContain('50k/1M');
 	});
 
 	it('压缩事件没带 tokensSaved 时只显示时长', () => {

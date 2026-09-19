@@ -12,6 +12,7 @@
 //
 // 本 mod 的做法是可恢复的：占位符里给**绝对路径**，模型能 read_file 读回全文。
 // 所以在阈值上要**抢在 CLI 的破坏性裁剪（0.5）之前**动手，默认 0.45。
+// 本 mod **默认关闭**，需 `--mod-option contextSlim=true` 显式开启。
 //
 // 三条纪律：
 //  1. **只换文本、不删块**。删掉 tool_result 会让 assistant 的 tool_use 失去配对，
@@ -226,10 +227,11 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 export default function contextSlimMod(cmd: ModApi): void {
+	// 默认关闭：归档会改写送进模型的消息，先要求显式开启（--mod-option contextSlim=true）。
 	cmd.addFlag('contextSlim', {
 		type: 'boolean',
-		default: true,
-		description: '接近上下文上限前，把旧的巨型工具结果归档成占位符 + 文件路径。',
+		default: false,
+		description: '接近上下文上限前，把旧的巨型工具结果归档成占位符 + 文件路径（默认关闭）。',
 	});
 	cmd.addFlag('contextSlimThreshold', {
 		type: 'string',
@@ -313,7 +315,9 @@ export default function contextSlimMod(cmd: ModApi): void {
 	cmd.hooks({
 		transformContext: ({messages}) => {
 			const list = Array.isArray(messages) ? messages : [];
-			if (!flagEnabled(cmd, 'contextSlim')) return list;
+			// 第三参必须显式给 false：flagEnabled 的 fallback 自带默认值 true，
+			// 不传就会在「拿不到 flag」时反手打开，与 addFlag 的默认值不一致。
+			if (!flagEnabled(cmd, 'contextSlim', false)) return list;
 			if (lastInputTokens <= 0) return list;
 
 			const override = asPositiveNumber(Number(cmd.getFlag('contextWindow')));

@@ -48,6 +48,7 @@ ctx ██████████████████░░ 90% 900k/1M · 
 - 子代理的请求也走 `model_request_end`，靠 `subagent_start` / `subagent_stop` 的深度计数挡掉，避免进度条跳到子上下文长度。
 - 进度条本身颜色随占用率变：<60% 绿，≥60% 黄，≥85% 红。条形宽度按终端列数分档。
 - **压缩摘要**：`compaction_done` 后往末尾追加 `· ⟳ <距现在多久> [-<省下的 token>]`，靠一个 unref 的 1s 定时器把时长刷新出来（事件没带 `tokensSaved` 时省略省下的部分），`session_start` 清空。
+- **压缩后进度条立即回落**：事件只带 `tokensSaved`、**不带压缩后的真实用量**，所以那一刻直接用 `used - tokensSaved` 把占用扣下去——右侧数字立刻变小，不用等下一轮请求。这是估算值，**下一轮 `model_request_end` 会用真实 `usage` 覆盖它**（所以压缩后数字可能先跳一下再定）。
 
 #### 为什么缓存用「会话累计」而不是「最近一次」（实测）
 
@@ -173,6 +174,8 @@ cmd --mod-option pasteFoldLimit=20000    # 调阈值
 
 ### `mods/context-slim.ts`
 
+> **默认关闭**：需 `--mod-option contextSlim=true` 显式开启。
+
 接近上下文上限前，把**旧的巨型工具结果**换成「占位符 + 落盘路径」：
 
 ```
@@ -190,7 +193,7 @@ cmd --mod-option pasteFoldLimit=20000    # 调阈值
 - 落盘失败就不替换：**没有回溯路径的归档等于删数据**。
 
 ```powershell
-cmd --mod-option contextSlim=false             # 关掉
+cmd --mod-option contextSlim=true              # 开启（默认关闭）
 cmd --mod-option contextSlimThreshold=0.45     # 触发比例（须低于 CLI 的 0.5）
 cmd --mod-option contextSlimMinYield=20000     # 释放量下限（字符）
 cmd --mod-option contextSlimKeepMessages=4     # 保护的最近消息条数
@@ -221,12 +224,12 @@ cmd --mod-option contextSlimKeepMessages=4     # 保护的最近消息条数
 
 #### 与其他 mod 的分工
 
-| mod | 层次 | 处理对象 | 效果 |
-|---|---|---|---|
-| `output-fold` | 第一层 | **最新**的工具结果 | 折叠成头尾，仍占约 12K 字符 |
-| `context-slim` | 第二层 | **旧的**工具结果 | 整个换成一行路径，只占约 150 字符 |
+| mod | 层次 | 默认 | 处理对象 | 效果 |
+|---|---|---|---|---|
+| `output-fold` | 第一层 | 开 | **最新**的工具结果 | 折叠成头尾，仍占约 12K 字符 |
+| `context-slim` | 第二层 | **关** | **旧的**工具结果 | 整个换成一行路径，只占约 150 字符 |
 
-两者默认同时生效，且**必须同时生效**：`context-slim` 会把 `output-fold` 折过的内容进一步归档（那正是最该归档的一批）。早期版本里 `context-slim` 因为跳过带 `folded` 标记的内容而在默认配置下完全失效——真机验证时才发现，单测抓不到这种跨 mod 交互。
+`context-slim` **默认关闭**，要用得显式开 `--mod-option contextSlim=true`。开启后它应当与 `output-fold` 同时生效：`context-slim` 会把 `output-fold` 折过的内容进一步归档（那正是最该归档的一批）。早期版本里 `context-slim` 因为跳过带 `folded` 标记的内容而在开启配置下完全失效——真机验证时才发现，单测抓不到这种跨 mod 交互。
 
 代价是回溯链变成两级：占位符 → `slimmed/` 文件（折过的文本）→ 其中记录的 `tool-output/` 路径（CLI 截断后的版本）→ CLI 的 `toolout` 文件（原始全文）。每级都给了路径，模型可以逐级追。
 
@@ -271,7 +274,7 @@ cmd --mod .\mods\context-usage.ts
 
 1. 在 `mods/` 下建 `xxx.ts`，默认导出 `(cmd: ModApi) => void`。
 2. 在 `tests/` 下建 `xxx.test.ts`，把纯逻辑（格式化、解析、判定）导出后直接测——把逻辑从事件回调里拆出来，才能真正测。接线另建 `xxx.mod.test.ts`，用最小 `ModApi` 桩驱动事件/hook。
-3. 复用 `mods/lib/`，别复制粘贴：`flags`（开关判定）、`text`（字符度量与折叠）、`spill`（大文本落盘）、`shell`（命令构造）。放 `mods/lib/` 下的文件不会被当成 mod 加载。
+3. 复用 `mods/lib/`，别复制粘贴：`flags`（开关判定）、`text`（字符度量与折叠）、`spill`（大文本落盘）、`shell`（命令构造）、`model-catalog`（模型名归一化与上下文上限解析）。放 `mods/lib/` 下的文件不会被当成 mod 加载。
 4. `commandcode.mods` 的 glob 会自动带上新文件，无需改 `package.json`。
 5. 完整 `ModApi` 契约见 cmdc 自带的 mod-builder 技能：`reference/api.md`、`reference/hooks-and-events.md`、`reference/ui.md`。
 
@@ -279,6 +282,7 @@ cmd --mod .\mods\context-usage.ts
 
 - `--mod-option` 是**全局命名空间**，flag 名一律带 mod 前缀（`outputFold` / `inputShortcuts` / `contextWindow` …），否则不同 mod 会撞名。
 - 新开关默认开启：`addFlag(name, {type:'boolean', default:true})`，判定统一走 `lib/flags` 的 `flagEnabled`（容错字符串 `false` / `0` / `no` / `off`，未设置时回落 default）。
+- **默认关闭的开关**（如 `contextSlim`）：`addFlag` 写 `default:false`，且调用处要显式传第三参 `flagEnabled(cmd, 'x', false)` —— `flagEnabled` 的 fallback 参数自带默认值 `true`，不传就会在「拿不到 flag」时反手打开，与 `addFlag` 的默认值不一致，而且是静默的。
 - **开关必须在运行时判定（实测教训，别踩）**：`cmd.getFlag()` 在 **factory 阶段恒为 default**，拿不到 `--mod-option` 的值；只有 harness bind 之后（`on` 回调 / hook 里）才返回真实值。所以 `addFlag` 在 factory 里声明，但**读取要放进 hook 或事件回调**。
   **不要在 factory 里写 `if (!flagEnabled(cmd, 'x')) return;`** —— 那样读到的是 default，开关永远失效，而且不会报错，是静默失效。
   ```ts
