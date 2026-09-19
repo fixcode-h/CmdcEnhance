@@ -180,28 +180,28 @@ describe('renderStatus 的缓存段', () => {
 
 	it('把会话累计命中率显示成百分比', () => {
 		const text = renderStatus({...base, cache: {hitRate: 0.98, written: 0}});
-		expect(text).toContain('cache 98%');
+		expect(text).toContain('cache 98.00%');
 	});
 
-	it('四舍五入到整数百分比', () => {
-		expect(renderStatus({...base, cache: {hitRate: 0.485, written: 0}})).toContain('cache 49%');
-		expect(renderStatus({...base, cache: {hitRate: 0.484, written: 0}})).toContain('cache 48%');
+	it('保留两位小数', () => {
+		expect(renderStatus({...base, cache: {hitRate: 0.485, written: 0}})).toContain('cache 48.50%');
+		expect(renderStatus({...base, cache: {hitRate: 0.484, written: 0}})).toContain('cache 48.40%');
 	});
 
 	it('有缓存写入时附上写入量', () => {
 		const text = renderStatus({...base, cache: {hitRate: 0.48, written: 12_000}});
-		expect(text).toContain('cache 48% +12k');
+		expect(text).toContain('cache 48.00% +12k');
 	});
 
 	it('写入量为 0 时不带 + 后缀', () => {
 		const text = renderStatus({...base, cache: {hitRate: 0.98, written: 0}});
-		expect(text).toContain('cache 98%');
+		expect(text).toContain('cache 98.00%');
 		expect(text).not.toContain('+');
 	});
 
 	it('命中率为 0 也照样显示', () => {
 		const text = renderStatus({...base, cache: {hitRate: 0, written: 5000}});
-		expect(text).toContain('cache 0% +5k');
+		expect(text).toContain('cache 0.00% +5k');
 	});
 
 	it('没有缓存信息时不追加', () => {

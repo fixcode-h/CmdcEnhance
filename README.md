@@ -37,14 +37,14 @@ types/     @commandcode/harness 的最小类型声明
 ```
 ctx ██████████████████░░ 90% 900k/1M
 ctx ██████████████████░░ 90% 900k/1M · ↑3.6M ↓42k
-ctx ██████████████████░░ 90% 900k/1M · ↑3.6M ↓42k · cache 89% +12k · ⟳ 3m -30k
+ctx ██████████████████░░ 90% 900k/1M · ↑3.6M ↓42k · cache 89.00% +12k · ⟳ 3m -30k
 ```
 
 - **上限从哪来**（按优先级）：`--mod-option contextWindow=<token 数>` → `~/.commandcode/providers.json`（BYOK 的 `contextWindow`）→ `~/.commandcode/cache/models-dev.json` 目录 → 兜底 `200000`。走兜底时数字前面加 `~`，表示这是猜的。
 - **模型从哪来**：`model_request_start` / `model_request_end` 事件。启动到第一次请求之间是事件静默期，此时用 `~/.commandcode/config.json` 的 `model` 兜底解析，否则首屏只能显示兜底的 `~200k`。
 - **占用口径** = `inputTokens + outputTokens`。CLI 的 `inputTokens` 已是整段 prompt 的总数（`cacheReadTokens` 是它的子集明细，不能相加）。
 - **会话累计** `↑输入 ↓输出` = 本会话每轮请求的 `inputTokens` / `outputTokens` 之和，`session_start` 清零，只算主上下文、不含子代理。**注意它和左边的 `900k/1M` 不是一回事**：`900k/1M` 是当前上下文长度（快照），`↑3.6M` 是「一共处理了多少 token」——每轮都会把整段 prompt 重发一遍，所以它会随轮次快速增长。首次请求前不显示。
-- **缓存段** = 会话累计命中率 `ΣcacheReadTokens / ΣinputTokens`，同样 `session_start` 清零。`+12k` 是会话累计写入缓存的量，只在本会话写过时才出现。**本会话从未有过缓存活动时整段不显示**——不支持 prompt 缓存的 provider 不该常驻一个 `cache 0%` 噪音。
+- **缓存段** = 会话累计命中率 `ΣcacheReadTokens / ΣinputTokens`，同样 `session_start` 清零。`+12k` 是会话累计写入缓存的量，只在本会话写过时才出现。**本会话从未有过缓存活动时整段不显示**——不支持 prompt 缓存的 provider 不该常驻一个 `cache 0.00%` 噪音。
 - 子代理的请求也走 `model_request_end`，靠 `subagent_start` / `subagent_stop` 的深度计数挡掉，避免进度条跳到子上下文长度。
 - 进度条本身颜色随占用率变：<60% 绿，≥60% 黄，≥85% 红。条形宽度按终端列数分档。
 - **压缩摘要**：`compaction_done` 后往末尾追加 `· ⟳ <距现在多久> [-<省下的 token>]`，靠一个 unref 的 1s 定时器把时长刷新出来（事件没带 `tokensSaved` 时省略省下的部分），`session_start` 清空。
@@ -63,7 +63,7 @@ ctx ██████████████████░░ 90% 900k/1M · 
 | 5 | **99%** | 89% |
 | 6 | **99%** | 90% |
 
-- **单次命中率从第 2 轮起就恒为 99~100%**：每轮只是把上一轮的 prompt 再发一遍，本来就几乎全命中。这个数字只在第 1 轮有信息量，之后永远是 `cache 99%`——看起来像坏了，其实只是没意义。
+- **单次命中率从第 2 轮起就恒为 99~100%**：每轮只是把上一轮的 prompt 再发一遍，本来就几乎全命中。这个数字只在第 1 轮有信息量，之后永远是 `cache 99.00%`——看起来像坏了，其实只是没意义。
 - **累计命中率才反映真实健康度**：它把会话早期的冷启动代价摊进来（48% → 90%），掉下来说明缓存被打破过。
 - 另一个理由是**尺度一致**：它紧挨着的 `↑输入 ↓输出` 本来就是会话累计，两者同尺度才不会出现「一个是整个对话、一个是这一瞬间」的错位。
 - `ΣcacheRead ≤ Σinput` 恒成立（每轮的 read 都是该轮 input 的子集），所以累计率不会溢出 100%，`Math.min(1, …)` 只是保险。

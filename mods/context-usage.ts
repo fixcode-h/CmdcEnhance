@@ -136,7 +136,7 @@ function renderCompaction(info: CompactionInfo): string {
 
 /** 会话累计的缓存命中率与写入量（两者都是整个对话的累计，与左边的 ↑/↓ 同尺度）。 */
 function renderCache(info: CacheInfo): string {
-	const percent = `${Math.round(info.hitRate * 100)}%`;
+	const percent = `${(info.hitRate * 100).toFixed(2)}%`;
 	// 累计写入量：只在本会话真写过缓存时出现。
 	const written = info.written > 0 ? ` +${formatTokens(info.written)}` : '';
 	return ` ${ANSI.dim}· cache ${percent}${written}${ANSI.reset}`;
@@ -196,7 +196,7 @@ export default function contextUsageMod(cmd: ModApi): void {
 
 	/**
 	 * 会话累计口径。只在**本会话真有过**缓存活动时出现：完全不支持 prompt 缓存的
-	 * provider 两项恒为 0，硬画一个 `cache 0%` 只是噪音。
+	 * provider 两项恒为 0，硬画一个 `cache 0.00%` 只是噪音。
 	 */
 	const cacheInfo = (): CacheInfo | undefined => {
 		if (sessionInput <= 0) return undefined;
