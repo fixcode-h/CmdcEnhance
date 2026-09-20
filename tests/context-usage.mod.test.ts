@@ -371,3 +371,150 @@ describe('contextUsageMod 的会话累计接线', () => {
 		expect(cmd.last().indexOf('↑')).toBeLessThan(cmd.last().indexOf('cache'));
 	});
 });
+
+describe('contextUsageMod 的速度段接线', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it('首次请求前不显示速度', () => {
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		expect(cmd.last()).not.toContain('⚡');
+	});
+
+	it('流式中按 delta 估算并标 ~，随 ticker 每秒刷新', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'x'.repeat(400)}); // 400 字符 ≈ 100 token
+		vi.advanceTimersByTime(1000);
+		expect(cmd.last()).toContain('⚡ ~100 tok/s');
+		vi.advanceTimersByTime(1000);
+		expect(cmd.last()).toContain('⚡ ~50 tok/s');
+	});
+
+	it('思考增量同样计入', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('thinking_delta', {delta: 'x'.repeat(800)}); // 800 字符 ≈ 200 token
+		vi.advanceTimersByTime(2000);
+		expect(cmd.last()).toContain('⚡ ~100 tok/s');
+	});
+
+	it('定稿用真实 outputTokens，分母是生成窗口、不含首字延迟', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		vi.advanceTimersByTime(3000); // 首字延迟 3s
+		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
+		vi.advanceTimersByTime(2000); // 生成 2s
+		cmd.emit('text_delta', {delta: 'y'.repeat(400)});
+		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 200}});
+		// 摊进首字延迟会得到 200/5s = 40；生成窗口算出来才是 100
+		expect(cmd.last()).toContain('⚡ 100 tok/s');
+		expect(cmd.last()).not.toContain('~');
+	});
+
+	it('收不到 delta 时退回整次请求的时长', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		vi.advanceTimersByTime(4000);
+		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 200}});
+		expect(cmd.last()).toContain('⚡ 50 tok/s');
+	});
+
+	it('窗口太短时先不显示，避免数字乱跳', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
+		expect(cmd.last()).not.toContain('⚡');
+	});
+
+	it('空闲时保留上一轮的定稿值', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		vi.advanceTimersByTime(3000);
+		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 150}});
+		expect(cmd.last()).toContain('⚡ 50 tok/s');
+		cmd.emit('model_request_start', {model: 'm'});
+		expect(cmd.last()).toContain('⚡ 50 tok/s');
+	});
+
+	it('该轮没有输出时保留上一轮的值', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		vi.advanceTimersByTime(2000);
+		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 100}});
+		expect(cmd.last()).toContain('⚡ 50 tok/s');
+		cmd.emit('model_request_start', {model: 'm'});
+		vi.advanceTimersByTime(2000);
+		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 0}});
+		expect(cmd.last()).toContain('⚡ 50 tok/s');
+	});
+
+	it('子代理的流式增量不污染主上下文的速度', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
+		cmd.emit('subagent_start');
+		cmd.emit('text_delta', {delta: 'y'.repeat(4000)}); // 若被计入会显示成 ~550 tok/s
+		cmd.emit('subagent_stop');
+		vi.advanceTimersByTime(2000);
+		expect(cmd.last()).toContain('⚡ ~50 tok/s');
+	});
+
+	it('session_start 清掉速度', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		vi.advanceTimersByTime(2000);
+		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 100}});
+		expect(cmd.last()).toContain('⚡');
+		cmd.emit('session_start');
+		expect(cmd.last()).not.toContain('⚡');
+	});
+
+	it('流式结束后停掉每秒重绘', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
+		vi.advanceTimersByTime(2000);
+		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 100}});
+		const before = cmd.frames.length;
+		vi.advanceTimersByTime(5000);
+		expect(cmd.frames).toHaveLength(before);
+	});
+
+	it('速度段排在会话累计之后、缓存之前', () => {
+		vi.useFakeTimers();
+		const cmd = fakeCmd({contextWindow: '1000000'});
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
+		vi.advanceTimersByTime(2000);
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 20_000, cacheReadTokens: 18_000, outputTokens: 100},
+		});
+		expect(cmd.last().indexOf('↓')).toBeLessThan(cmd.last().indexOf('⚡'));
+		expect(cmd.last().indexOf('⚡')).toBeLessThan(cmd.last().indexOf('cache'));
+	});
+});

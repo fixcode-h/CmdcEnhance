@@ -29,6 +29,8 @@ declare module '@commandcode/harness' {
 		/** `run_start`：本会话 id。用来给落盘目录分桶，跨会话互不覆盖。 */
 		readonly sessionId?: string;
 		readonly usage?: TokenUsage;
+		/** `text_delta` / `thinking_delta`：本次增量文本（估算流式速度用）。 */
+		readonly delta?: string;
 		/** `compaction_done`：本次压缩省下的 token（自动压缩只在 >0 时带）。 */
 		readonly tokensSaved?: number;
 		/** `compaction_done`：本会话累计省下的 token。 */

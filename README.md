@@ -37,7 +37,7 @@ types/     @commandcode/harness 的最小类型声明
 ```
 ctx ██████████████████░░ 90% 900k/1M
 ctx ██████████████████░░ 90% 900k/1M · ↑3.6M ↓42k
-ctx ██████████████████░░ 90% 900k/1M · ↑3.6M ↓42k · cache 89.00% +12k · ⟳ 3m -30k
+ctx ██████████████████░░ 90% 900k/1M · ↑3.6M ↓42k · ⚡ 48.2 tok/s · cache 89.00% +12k · ⟳ 3m -30k
 ```
 
 - **上限从哪来**（按优先级）：`--mod-option contextWindow=<token 数>` → `~/.commandcode/providers.json`（BYOK 的 `contextWindow`）→ `~/.commandcode/cache/models-dev.json` 目录 → 兜底 `200000`。走兜底时数字前面加 `~`，表示这是猜的。
@@ -45,10 +45,22 @@ ctx ██████████████████░░ 90% 900k/1M · 
 - **占用口径** = `inputTokens + outputTokens`。CLI 的 `inputTokens` 已是整段 prompt 的总数（`cacheReadTokens` 是它的子集明细，不能相加）。
 - **会话累计** `↑输入 ↓输出` = 本会话每轮请求的 `inputTokens` / `outputTokens` 之和，`session_start` 清零，只算主上下文、不含子代理。**注意它和左边的 `900k/1M` 不是一回事**：`900k/1M` 是当前上下文长度（快照），`↑3.6M` 是「一共处理了多少 token」——每轮都会把整段 prompt 重发一遍，所以它会随轮次快速增长。首次请求前不显示。
 - **缓存段** = 会话累计命中率 `ΣcacheReadTokens / ΣinputTokens`，同样 `session_start` 清零。`+12k` 是会话累计写入缓存的量，只在本会话写过时才出现。**本会话从未有过缓存活动时整段不显示**——不支持 prompt 缓存的 provider 不该常驻一个 `cache 0.00%` 噪音。
+- **速度段** `⚡ tok/s` = 最近一次生成的输出速度。分母是**生成窗口**（首个 delta → 最后一个 delta），分子是这一轮的 `outputTokens`。流式过程中分子只能由 `text_delta` / `thinking_delta` 的字符数估算（与 CLI 内部的 `estimateTokens2` 同口径：字符数 ÷ 4 向上取整），所以那时带 `~` 前缀；该轮 `model_request_end` 拿到真实 `outputTokens` 后用同一个窗口重算，去掉 `~`。空闲时保留最近一轮的值（新一轮开始不清空，否则数字会在两次生成之间闪一下），`session_start` 才清掉。
 - 子代理的请求也走 `model_request_end`，靠 `subagent_start` / `subagent_stop` 的深度计数挡掉，避免进度条跳到子上下文长度。
 - 进度条本身颜色随占用率变：<60% 绿，≥60% 黄，≥85% 红。条形宽度按终端列数分档。
 - **压缩摘要**：`compaction_done` 后往末尾追加 `· ⟳ <距现在多久> [-<省下的 token>]`，靠一个 unref 的 1s 定时器把时长刷新出来（事件没带 `tokensSaved` 时省略省下的部分），`session_start` 清空。
 - **压缩后进度条立即回落**：事件只带 `tokensSaved`、**不带压缩后的真实用量**，所以那一刻直接用 `used - tokensSaved` 把占用扣下去——右侧数字立刻变小，不用等下一轮请求。这是估算值，**下一轮 `model_request_end` 会用真实 `usage` 覆盖它**（所以压缩后数字可能先跳一下再定）。
+
+#### 速度段的分母为什么是「生成窗口」
+
+`model_request_start` → `model_request_end` 之间混着首字延迟：prompt 越长、缓存越冷，这段静默越久（长上下文下几秒到几十秒都常见）。把它算进分母，同一个模型在冷启动那一轮显得慢、在缓存命中的轮显得快——量到的是「等了多久」，不是「吐得多快」。所以分母只取首个 delta 到最后一个 delta。
+
+代价是它**不反映端到端体验**：上下文很大时，即使显示 `⚡ 60 tok/s`，你仍要等好几秒才看到第一个字。那部分延迟看左边的占用条与缓存命中率。
+
+另外两点：
+
+- **流式中的 `~` 值在中英混排时会偏低**：÷4 是 CLI 的通用估算，而实测英文约 4.96 字符/token、**中文只有 1.94**，中文占多数时 token 数会被算少近一半。所以那一刻的数字仅供参考——**定稿值用真实 `outputTokens`，没有这个偏差**。
+- **生成窗口不足 250ms 时先不显示**（`MIN_SPEED_WINDOW_MS`）：那么短的窗口里，一两个 token 的出入就能让数字跳一半。定稿时若生成窗口太短、或者压根没收到 delta（非流式、整段命中缓存），改用整次请求的时长兜底——这时会把首字延迟摊进来、数字偏低。
 
 #### 为什么缓存用「会话累计」而不是「最近一次」（实测）
 

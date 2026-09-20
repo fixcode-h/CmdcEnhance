@@ -10,9 +10,12 @@ import {
 import {
 	barWidthFor,
 	buildBar,
+	estimateStreamTokens,
 	formatDuration,
+	formatSpeed,
 	formatTokens,
 	renderStatus,
+	tokensPerSecond,
 } from '../mods/context-usage';
 
 const RED = '\u001b[31m';
@@ -259,6 +262,87 @@ describe('renderStatus 的会话累计段', () => {
 	it('排在 used/limit 之后，不干扰上下文占用读数', () => {
 		const text = renderStatus({...base, session: {input: 1_200_000, output: 45_000}});
 		expect(text.indexOf('50k/100k')).toBeLessThan(text.indexOf('↑'));
+	});
+});
+
+describe('estimateStreamTokens', () => {
+	// 与 CLI 内部 estimateTokens2（Math.ceil(len / 4)）同口径，改这里等于和 CLI 的口径分家。
+	it('字符数 ÷ 4 向上取整', () => {
+		expect(estimateStreamTokens(4)).toBe(1);
+		expect(estimateStreamTokens(5)).toBe(2);
+		expect(estimateStreamTokens(400)).toBe(100);
+	});
+
+	it('非正与非法值给 0', () => {
+		expect(estimateStreamTokens(0)).toBe(0);
+		expect(estimateStreamTokens(-4)).toBe(0);
+		expect(estimateStreamTokens(Number.NaN)).toBe(0);
+	});
+});
+
+describe('formatSpeed', () => {
+	it('百以下保留一位小数并去尾零', () => {
+		expect(formatSpeed(48.23)).toBe('48.2');
+		expect(formatSpeed(50)).toBe('50');
+		expect(formatSpeed(0.44)).toBe('0.4');
+	});
+
+	it('百以上取整', () => {
+		expect(formatSpeed(100)).toBe('100');
+		expect(formatSpeed(128.6)).toBe('129');
+	});
+
+	it('非正与非法值给 0', () => {
+		expect(formatSpeed(0)).toBe('0');
+		expect(formatSpeed(-1)).toBe('0');
+		expect(formatSpeed(Number.NaN)).toBe('0');
+		expect(formatSpeed(Number.POSITIVE_INFINITY)).toBe('0');
+	});
+});
+
+describe('tokensPerSecond', () => {
+	it('token 数 ÷ 秒数', () => {
+		expect(tokensPerSecond(100, 2000)).toBe(50);
+		expect(tokensPerSecond(300, 60_000)).toBe(5);
+	});
+
+	it('耗时为 0 或负数时返回 0，不除零', () => {
+		expect(tokensPerSecond(100, 0)).toBe(0);
+		expect(tokensPerSecond(100, -1)).toBe(0);
+	});
+
+	it('token 数为 0 或非法时返回 0', () => {
+		expect(tokensPerSecond(0, 1000)).toBe(0);
+		expect(tokensPerSecond(Number.NaN, 1000)).toBe(0);
+	});
+});
+
+describe('renderStatus 的速度段', () => {
+	const base = {used: 50_000, limit: 100_000, estimated: false, columns: 120};
+
+	it('显示成 ⚡ <n> tok/s', () => {
+		const text = renderStatus({...base, speed: {tps: 52.7, estimated: false}});
+		expect(text).toContain('⚡ 52.7 tok/s');
+	});
+
+	it('流式中的估算值加 ~ 前缀', () => {
+		const text = renderStatus({...base, speed: {tps: 48.2, estimated: true}});
+		expect(text).toContain('⚡ ~48.2 tok/s');
+	});
+
+	it('没有速度信息时不追加', () => {
+		expect(renderStatus(base)).not.toContain('⚡');
+	});
+
+	it('排在会话累计之后、缓存之前', () => {
+		const text = renderStatus({
+			...base,
+			session: {input: 1_200_000, output: 45_000},
+			speed: {tps: 50, estimated: false},
+			cache: {hitRate: 0.9, written: 0},
+		});
+		expect(text.indexOf('↑')).toBeLessThan(text.indexOf('⚡'));
+		expect(text.indexOf('⚡')).toBeLessThan(text.indexOf('cache'));
 	});
 });
 
