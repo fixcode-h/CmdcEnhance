@@ -543,4 +543,48 @@ describe('contextUsageMod 的速度段接线', () => {
 		vi.advanceTimersByTime(2000);
 		expect(cmd.last()).not.toContain('tok/s');
 	});
+
+	// 探针实测：有的 provider 在工具轮把 delta 成簇压到请求末尾投递——genWindow 只有
+	// 3~6ms（首个 delta 距请求结束仅 3~6ms），窗口外却仍有上百 token 输出。纯生成口径
+	// 被 MIN_GEN_MS 挡掉时不能再干等，否则 cmdc 里最常见的工具轮永远没有速率。
+	it('delta 成簇压到请求末尾时，回退到请求总时长口径', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		advance(6000); // TTFT：请求发出 6s 后才吐出这簇 delta
+		cmd.emit('text_delta', {delta: 'a'.repeat(50)});
+		advance(6); // 生成窗口只有 6ms，纯生成口径会被挡掉
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 10_000, outputTokens: 300},
+		});
+		// 回退口径：300 token ÷ 6006ms ≈ 50 tok/s（含 TTFT，偏保守但出得来数）。
+		expect(cmd.last()).toContain('50 tok/s');
+	});
+
+	// 整轮一个 delta 都没有（全走 tool input 的 JSON）时同样回退，而不是没有速率。
+	it('整轮没有任何 delta 时也回退到请求总时长', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		advance(4000);
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000, outputTokens: 200}});
+		expect(cmd.last()).toContain('50 tok/s');
+	});
+
+	// 纯生成窗口有效时必须优先用它——回退口径含 TTFT，数字明显偏小，不能反过来盖掉。
+	it('纯生成窗口有效时不回退到总时长（不被偏小的值覆盖）', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		advance(5000); // 长 TTFT，回退口径会算出 900/6000 = 150
+		cmd.emit('text_delta', {delta: 'a'.repeat(900)});
+		advance(1000); // 纯生成窗口 1000ms → 900 tok/s
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000, outputTokens: 900}});
+		expect(cmd.last()).toContain('900 tok/s');
+		expect(cmd.last()).not.toContain('150 tok/s');
+	});
 });

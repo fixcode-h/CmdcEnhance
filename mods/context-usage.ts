@@ -35,6 +35,9 @@ const ANSI = {
  * 事件里**没有**任何耗时字段（`model_request_end` 只带 model/usage/stopReason/effort），
  * 时间只能自己量；而 delta 是**成簇**投递的——实测一轮 477 个 delta 只落在 18 个不同
  * 时间戳上，簇内时间差为 0，除出来是 ∞。所以只按窗口平均值算，绝不算瞬时值。
+ *
+ * 它同时是**纯生成窗口**的下限：窗口短于此值就认为没量到真实生成过程，速率改用
+ * 回退口径（请求总时长，见 `finishRequest`），而不是不出数。
  */
 export const MIN_GEN_MS = 200;
 
@@ -245,6 +248,8 @@ export default function contextUsageMod(cmd: ModApi): void {
 
 	// —— 生成速率（tok/s）——
 	// 事件不带耗时，时间只能自己量：本轮首个 delta 记生成窗口起点，请求结束出结果。
+	/** 本轮请求发出的时间；0 表示没见过 start（例如只喂了 end 的桩）。回退口径的起点。 */
+	let requestStartAt = 0;
 	/** 本轮首个 delta 的时间；0 表示本轮还没开始吐字。 */
 	let firstDeltaAt = 0;
 	/** 本轮已收到的字符数（text + thinking，它们都是模型吐出来的 token）。 */
@@ -269,11 +274,28 @@ export default function contextUsageMod(cmd: ModApi): void {
 		streamChars += delta.length;
 	};
 
-	/** 本轮结束：用真实 outputTokens ÷ 真实生成窗口结算，并用它标定字符/token。 */
+	/**
+	 * 本轮结束结算速率。
+	 *
+	 * 首选**纯生成**口径：真实 outputTokens ÷ (end − 首个 delta)。
+	 * 但实测有的 provider/模型在**工具轮**把 delta 成簇压到请求末尾投递——探针实测
+	 * `genWindow=3~6ms`（首个 delta 距请求结束仅 3~6ms）、而窗口外仍有 179 token 输出，
+	 * 这种窗口全是计时噪声，`computeSpeed` 会挡掉它。此时回退到**请求总时长**口径
+	 * （end − start）：它含 TTFT、数字偏小，但任何轮次都出得来数——工具轮在 cmdc 里
+	 * 是常态，宁可用一个偏保守的值，也别让状态栏常驻没有速率。
+	 */
 	const finishRequest = (outputTokens: number, endedAt: number): void => {
+		// 首选纯生成口径；它被挡掉时（窗口太短）才退回请求总时长。
+		const measured =
+			firstDeltaAt > 0 ? computeSpeed(outputTokens, endedAt - firstDeltaAt) : undefined;
+		if (measured !== undefined) {
+			speed = measured;
+		} else if (requestStartAt > 0) {
+			const fallback = computeSpeed(outputTokens, endedAt - requestStartAt);
+			if (fallback !== undefined) speed = fallback;
+		}
+		// 标定只依赖字符数与 token 数，与窗口口径无关，两种情况下都要更新。
 		if (firstDeltaAt > 0) {
-			const measured = computeSpeed(outputTokens, endedAt - firstDeltaAt);
-			if (measured !== undefined) speed = measured;
 			const ratio = calibrateCharsPerToken(outputTokens, streamChars);
 			if (ratio !== undefined) calibrated = ratio;
 		}
@@ -374,6 +396,7 @@ export default function contextUsageMod(cmd: ModApi): void {
 
 	/** 一轮开始的公共重置：本轮还没吐字，窗口与计数都归零。 */
 	const beginRequest = (): void => {
+		requestStartAt = 0;
 		firstDeltaAt = 0;
 		streamChars = 0;
 		streaming = false;
@@ -383,6 +406,8 @@ export default function contextUsageMod(cmd: ModApi): void {
 		if (subagentDepth > 0) return;
 		if (typeof event.model === 'string' && event.model) model = event.model;
 		beginRequest();
+		// 回退口径（请求总时长）的起点；纯生成口径的首个 delta 会在 text/thinking_delta 里补上。
+		requestStartAt = Date.now();
 		paint();
 	});
 
