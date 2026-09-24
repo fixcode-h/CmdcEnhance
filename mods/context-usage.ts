@@ -11,15 +11,8 @@
 //
 // 会话累计（↑/↓）是另一个维度的数：把每轮的 inputTokens/outputTokens 累加，
 // 衡量「本会话一共处理了多少 token」，不是上下文长度——每轮都会把整段 prompt 重发一遍。
-//
-// 速度段（⚡ tok/s）的分母是「首个 delta → 最后一个 delta」的**生成窗口**，不含首字延迟
-// （TTFT）。TTFT 随 prompt 长度与缓存命中情况波动极大（几秒到几十秒），摊进分母后同一个
-// 模型的速度数字会忽高忽低，量出来的是「等了多久」而不是「吐得多快」。流式过程中分子只能
-// 靠 delta 字符数估算（`text_delta` / `thinking_delta`，口径与 CLI 内部的 estimateTokens2
-// 一致：字符数 ÷ 4 向上取整），显示时加 `~`；该轮 `model_request_end` 拿到真实
-// `outputTokens` 后重算并去掉 `~`，所以最终值不含估算偏差。
 
-import type {AgentEvent, ModApi} from '@commandcode/harness';
+import type {ModApi} from '@commandcode/harness';
 import {
 	asPositiveNumber,
 	loadCatalogLimits,
@@ -35,6 +28,22 @@ const ANSI = {
 	yellow: '\u001b[33m',
 	red: '\u001b[31m',
 };
+
+/**
+ * 生成速率（tok/s）的最短统计窗口。低于它的商全是计时噪声。
+ *
+ * 事件里**没有**任何耗时字段（`model_request_end` 只带 model/usage/stopReason/effort），
+ * 时间只能自己量；而 delta 是**成簇**投递的——实测一轮 477 个 delta 只落在 18 个不同
+ * 时间戳上，簇内时间差为 0，除出来是 ∞。所以只按窗口平均值算，绝不算瞬时值。
+ *
+ * 它同时是**纯生成窗口**的下限：窗口短于此值就认为没量到真实生成过程，速率改用
+ * 回退口径（请求总时长，见 `finishRequest`），而不是不出数。
+ */
+export const MIN_GEN_MS = 200;
+
+/** 标定值的夹取区间：实测英文输出约 2.75 字符/token，中文会低到 1 附近。 */
+export const MIN_CHARS_PER_TOKEN = 1;
+export const MAX_CHARS_PER_TOKEN = 6;
 
 /** 最近一次上下文压缩（自动或 /compact）的摘要。 */
 export interface CompactionInfo {
@@ -70,17 +79,6 @@ export interface SessionInfo {
 	readonly output: number;
 }
 
-/**
- * 最近一次生成的输出速度（token/秒）。
- *
- * 分母是生成窗口（首个 delta → 最后一个 delta），不含首字延迟，详见文件头。
- * `estimated` 为 true 表示还在流式中，分子由 delta 字符数估算而来（显示时加 `~`）。
- */
-export interface SpeedInfo {
-	readonly tps: number;
-	readonly estimated: boolean;
-}
-
 export interface StatusInput {
 	readonly used: number;
 	readonly limit: number;
@@ -93,8 +91,8 @@ export interface StatusInput {
 	readonly cache?: CacheInfo;
 	/** 有则追加到状态栏末尾。 */
 	readonly session?: SessionInfo;
-	/** 有则追加到状态栏末尾。 */
-	readonly speed?: SpeedInfo;
+	/** 最近一轮的生成速率（tok/s）。取不到生成窗口时不显示。 */
+	readonly speed?: number;
 }
 
 function trimZeros(value: number, digits: number): string {
@@ -106,39 +104,6 @@ export function formatTokens(value: number): string {
 	if (value >= 1_000_000) return `${trimZeros(value / 1_000_000, 2)}M`;
 	if (value >= 1_000) return `${trimZeros(value / 1_000, 1)}k`;
 	return String(Math.round(value));
-}
-
-/** CLI 内部 `estimateTokens2` 用的除数（源码里是 `ww = 4`）。 */
-const CHARS_PER_TOKEN = 4;
-
-/**
- * 生成窗口短于这个毫秒数时速度会剧烈抖动（两三个 token 除以 0.1 秒能算出几百 tok/s），
- * 这种情况宁可退回更长的窗口，或者干脆不显示。
- */
-const MIN_SPEED_WINDOW_MS = 250;
-
-/**
- * 流式过程中把 delta 字符数换算成 token 数。
- *
- * 与 CLI 的 `estimateTokens2`（`Math.ceil(len / 4)`）同口径——子代理 `tokensUsed` 也是这么估的。
- * 只喂给生成中的实时速度；该轮结束会用真实 `outputTokens` 重算。
- */
-export function estimateStreamTokens(chars: number): number {
-	if (!Number.isFinite(chars) || chars <= 0) return 0;
-	return Math.ceil(chars / CHARS_PER_TOKEN);
-}
-
-/** 速度保留一位小数（百以上取整）：状态栏空间有限，小数点后第二位的抖动没有意义。 */
-export function formatSpeed(value: number): string {
-	if (!Number.isFinite(value) || value <= 0) return '0';
-	return value >= 100 ? String(Math.round(value)) : trimZeros(value, 1);
-}
-
-/** token 数 ÷ 耗时（毫秒）。任一侧非正时返回 0，由调用方决定要不要显示这一段。 */
-export function tokensPerSecond(tokens: number, elapsedMs: number): number {
-	if (!Number.isFinite(tokens) || tokens <= 0) return 0;
-	if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 0;
-	return tokens / (elapsedMs / 1000);
 }
 
 /** 把毫秒数压成紧凑时长：45s / 3m / 2h5m / 1d3h。 */
@@ -164,6 +129,41 @@ export function barWidthFor(columns: number): number {
 	if (columns >= 110) return 20;
 	if (columns >= 80) return 14;
 	return 8;
+}
+
+/** 把毫秒差换算成速率；窗口太短或输出为 0 时返回 undefined（宁可不显示也不报错数）。 */
+export function computeSpeed(outputTokens: number, genMs: number): number | undefined {
+	if (!Number.isFinite(outputTokens) || outputTokens <= 0) return undefined;
+	if (!Number.isFinite(genMs) || genMs < MIN_GEN_MS) return undefined;
+	return (outputTokens / genMs) * 1000;
+}
+
+/**
+ * 用上一轮**真实**的 outputTokens ÷ 已收字符数标定「字符/token」，供本轮流式中估算。
+ *
+ * 为什么需要它：流式期间只数得到字符（delta 是文本增量），拿不到 token 数；而字符/token
+ * 对语言极敏感（实测英文约 2.75，中文接近 1）。用同一会话上一轮的比例去推本轮，比拍一个
+ * 固定估值可靠得多——实测某模型只有 0.9 字符/token，拿 3 去估会低估 3 倍以上。
+ * 缺数据时返回 undefined，调用方据此**不做估算**，而不是退回到一个猜的估值。
+ */
+export function calibrateCharsPerToken(outputTokens: number, chars: number): number | undefined {
+	if (!Number.isFinite(outputTokens) || outputTokens <= 0) return undefined;
+	if (!Number.isFinite(chars) || chars <= 0) return undefined;
+	const ratio = chars / outputTokens;
+	if (!Number.isFinite(ratio) || ratio <= 0) return undefined;
+	return Math.min(MAX_CHARS_PER_TOKEN, Math.max(MIN_CHARS_PER_TOKEN, ratio));
+}
+
+/** 把 tok/s 压成短标签：`376 tok/s` / `86 tok/s` / `1.2k tok/s`。 */
+export function formatSpeed(speed: number): string {
+	if (!Number.isFinite(speed) || speed <= 0) return '';
+	if (speed >= 1000) return `${trimZeros(speed / 1000, 1)}k tok/s`;
+	return `${Math.round(speed)} tok/s`;
+}
+
+function renderSpeed(speed: number): string {
+	const text = formatSpeed(speed);
+	return text ? ` ${ANSI.dim}· ${text}${ANSI.reset}` : '';
 }
 
 const FILL = '█';
@@ -200,12 +200,6 @@ function renderSession(info: SessionInfo): string {
 	return ` ${ANSI.dim}· ↑${formatTokens(info.input)} ↓${formatTokens(info.output)}${ANSI.reset}`;
 }
 
-/** ⚡ 最近一次生成的输出速度；流式中的估算值加 ~ 前缀（与上限的 ~ 同义：这是猜的）。 */
-function renderSpeed(info: SpeedInfo): string {
-	const prefix = info.estimated ? '~' : '';
-	return ` ${ANSI.dim}· ⚡ ${prefix}${formatSpeed(info.tps)} tok/s${ANSI.reset}`;
-}
-
 export function renderStatus(input: StatusInput): string {
 	const width = barWidthFor(input.columns);
 	const ratio = input.limit > 0 ? input.used / input.limit : 0;
@@ -218,8 +212,8 @@ export function renderStatus(input: StatusInput): string {
 		`${bar}${ANSI.reset} ` +
 		`${color}${percent}${ANSI.reset} ` +
 		`${ANSI.dim}${formatTokens(input.used)}/${limitText}${ANSI.reset}` +
-		(input.session ? renderSession(input.session) : '') +
 		(input.speed ? renderSpeed(input.speed) : '') +
+		(input.session ? renderSession(input.session) : '') +
 		(input.cache ? renderCache(input.cache) : '') +
 		(input.compaction ? renderCompaction(input.compaction) : '')
 	);
@@ -251,15 +245,77 @@ export default function contextUsageMod(cmd: ModApi): void {
 	let compactionSaved = 0;
 	// 压缩后状态栏要显示「距现在多久」，靠这个定时器把时长刷出来。
 	let ticker: ReturnType<typeof setInterval> | undefined;
-	// 速度段的状态。requestStartAt 是整次请求的起点，只在收不到 delta 时当兜底分母；
-	// streamStartAt / lastDeltaAt 夹出真正的生成窗口（详见文件头）。
-	let requestStartAt: number | undefined;
-	let streamStartAt: number | undefined;
-	let lastDeltaAt: number | undefined;
+
+	// —— 生成速率（tok/s）——
+	// 事件不带耗时，时间只能自己量：本轮首个 delta 记生成窗口起点，请求结束出结果。
+	/** 本轮请求发出的时间；0 表示没见过 start（例如只喂了 end 的桩）。回退口径的起点。 */
+	let requestStartAt = 0;
+	/** 本轮首个 delta 的时间；0 表示本轮还没开始吐字。 */
+	let firstDeltaAt = 0;
+	/** 本轮已收到的字符数（text + thinking，它们都是模型吐出来的 token）。 */
 	let streamChars = 0;
-	// 最近一次定稿的速度（该轮 `model_request_end` 用真实 usage 算出）。空闲时显示的就是它，
-	// 新一轮开始不清空——否则状态栏会在两次生成之间闪一下没数字。
-	let speed: SpeedInfo | undefined;
+	/** 当前是否处于流式生成中（决定要不要按秒重绘）。 */
+	let streaming = false;
+	/** 最近一次结算出的速率；用真实 outputTokens ÷ 真实生成窗口。 */
+	let speed: number | undefined;
+	/**
+	 * 「字符/token」的标定值，由上一轮的真实数据算出；**首轮为 undefined**。
+	 *
+	 * 没有它就不做流式估算：初值只能靠猜，而实测同一模型可能偏离估值 3 倍以上
+	 * （真机：471 字符 / 520 token，即 0.9 字符/token，而估值是 3），估算出来的
+	 * 数字错得比没有更糟。宁可首轮只显示结束后的真实值。
+	 */
+	let calibrated: number | undefined;
+
+	/** 记录一段文本增量：第一次出现时开窗口，之后累加字符数。 */
+	const noteDelta = (delta: unknown): void => {
+		if (typeof delta !== 'string' || !delta) return;
+		if (firstDeltaAt === 0) firstDeltaAt = Date.now();
+		streamChars += delta.length;
+	};
+
+	/**
+	 * 本轮结束结算速率。
+	 *
+	 * 首选**纯生成**口径：真实 outputTokens ÷ (end − 首个 delta)。
+	 * 但实测有的 provider/模型在**工具轮**把 delta 成簇压到请求末尾投递——探针实测
+	 * `genWindow=3~6ms`（首个 delta 距请求结束仅 3~6ms）、而窗口外仍有 179 token 输出，
+	 * 这种窗口全是计时噪声，`computeSpeed` 会挡掉它。此时回退到**请求总时长**口径
+	 * （end − start）：它含 TTFT、数字偏小，但任何轮次都出得来数——工具轮在 cmdc 里
+	 * 是常态，宁可用一个偏保守的值，也别让状态栏常驻没有速率。
+	 */
+	const finishRequest = (outputTokens: number, endedAt: number): void => {
+		// 首选纯生成口径；它被挡掉时（窗口太短）才退回请求总时长。
+		const measured =
+			firstDeltaAt > 0 ? computeSpeed(outputTokens, endedAt - firstDeltaAt) : undefined;
+		if (measured !== undefined) {
+			speed = measured;
+		} else if (requestStartAt > 0) {
+			const fallback = computeSpeed(outputTokens, endedAt - requestStartAt);
+			if (fallback !== undefined) speed = fallback;
+		}
+		// 标定只依赖字符数与 token 数，与窗口口径无关，两种情况下都要更新。
+		if (firstDeltaAt > 0) {
+			const ratio = calibrateCharsPerToken(outputTokens, streamChars);
+			if (ratio !== undefined) calibrated = ratio;
+		}
+		streaming = false;
+	};
+
+	/**
+	 * 当前要显示的速率。生成中且**有标定值**时按字符估算（随秒往前爬），否则用上一轮的结算值。
+	 *
+	 * 首轮没有标定值就不估算——初值只能靠猜，而实测同一模型可以偏离估值 3 倍以上
+	 * （真机：471 字符 / 520 token，即 0.9 字符/token，估值是 3），估出来的数错得比没有更糟。
+	 * 从第二轮起标定值来自上一轮真实数据，估算才可信。
+	 */
+	const liveSpeed = (): number | undefined => {
+		if (streaming && firstDeltaAt > 0 && streamChars > 0 && calibrated !== undefined) {
+			const estimate = computeSpeed(streamChars / calibrated, Date.now() - firstDeltaAt);
+			if (estimate !== undefined) return estimate;
+		}
+		return speed;
+	};
 
 	const override = (): number | undefined => asPositiveNumber(Number(cmd.getFlag('contextWindow')));
 
@@ -282,39 +338,6 @@ export default function contextUsageMod(cmd: ModApi): void {
 			? {input: sessionInput, output: sessionOutput}
 			: undefined;
 
-	/**
-	 * 流式中的实时速度：分子是 delta 估算出的 token 数，分母是「首个 delta → 现在」。
-	 * 窗口太短时先不显示——头一两百毫秒里算出来的数字只会剧烈跳动，等一两秒再说。
-	 */
-	const liveSpeed = (): SpeedInfo | undefined => {
-		if (streamStartAt === undefined || streamChars <= 0) return undefined;
-		const elapsed = Date.now() - streamStartAt;
-		if (elapsed < MIN_SPEED_WINDOW_MS) return undefined;
-		const tps = tokensPerSecond(estimateStreamTokens(streamChars), elapsed);
-		return tps > 0 ? {tps, estimated: true} : undefined;
-	};
-
-	/**
-	 * 该轮结束时定稿：分子换成真实 `outputTokens`，分母仍是生成窗口。
-	 *
-	 * 一个 delta 都没收到（非流式、或者整段命中缓存）或生成窗口太短时，退回整次请求的时长——
-	 * 那样会把首字延迟摊进来、数字偏低，但总比不显示好。两个窗口都不可用就返回 undefined，
-	 * 让上一轮的显示继续留在状态栏上。
-	 */
-	const settledSpeed = (tokens: number, endAt: number): SpeedInfo | undefined => {
-		if (tokens <= 0) return undefined;
-		const genMs =
-			streamStartAt !== undefined && lastDeltaAt !== undefined ? lastDeltaAt - streamStartAt : 0;
-		const requestMs = requestStartAt !== undefined ? endAt - requestStartAt : 0;
-		const window = genMs >= MIN_SPEED_WINDOW_MS ? genMs : requestMs;
-		if (window < MIN_SPEED_WINDOW_MS) return undefined;
-		const tps = tokensPerSecond(tokens, window);
-		return tps > 0 ? {tps, estimated: false} : undefined;
-	};
-
-	/** 流式中给实时值，否则给最近一次的定稿值。 */
-	const currentSpeed = (): SpeedInfo | undefined => liveSpeed() ?? speed;
-
 	const paint = (): void => {
 		const resolved = resolveLimit({
 			model,
@@ -324,14 +347,14 @@ export default function contextUsageMod(cmd: ModApi): void {
 		});
 		const cache = cacheInfo();
 		const session = sessionInfo();
-		const current = currentSpeed();
+		const current = liveSpeed();
 		const text = renderStatus({
 			used,
 			limit: resolved.limit,
 			estimated: resolved.source === 'default',
 			columns: process.stdout.columns ?? 0,
+			...(current === undefined ? {} : {speed: current}),
 			...(session ? {session} : {}),
-			...(current ? {speed: current} : {}),
 			...(cache ? {cache} : {}),
 			...(compactionAt === undefined
 				? {}
@@ -355,37 +378,56 @@ export default function contextUsageMod(cmd: ModApi): void {
 		ticker = undefined;
 	};
 
-	/** ticker 只在有东西需要按秒刷新时才跑：压缩倒计时，或者流式中的实时速度。 */
-	const syncTicker = (): void => {
-		if (compactionAt !== undefined || streamStartAt !== undefined) startTicker();
-		else stopTicker();
+	// 流式期间速率的估算值会随时间往前爬，得按秒重绘才看得到；请求结束即停。
+	// 不能挂在 delta 上重绘——实测一轮 477 个 delta，那会变成每秒几百次 setStatus。
+	let streamTicker: ReturnType<typeof setInterval> | undefined;
+
+	const startStreamTicker = (): void => {
+		if (streamTicker) return;
+		streamTicker = setInterval(paint, 1000);
+		streamTicker.unref?.();
 	};
 
-	// 流式增量只累加、不直接重绘：每个 token 都调一次 setStatus 会白白重画几十上百次，
-	// 交给 1s 的 ticker 统一刷（由 syncTicker 拉起）。
-	const onDelta = (event: AgentEvent): void => {
-		if (subagentDepth > 0) return;
-		if (typeof event.delta !== 'string' || !event.delta) return;
-		const now = Date.now();
-		streamStartAt ??= now;
-		lastDeltaAt = now;
-		streamChars += event.delta.length;
-		syncTicker();
+	const stopStreamTicker = (): void => {
+		if (!streamTicker) return;
+		clearInterval(streamTicker);
+		streamTicker = undefined;
 	};
 
-	cmd.on('text_delta', onDelta);
-	cmd.on('thinking_delta', onDelta);
+	/** 一轮开始的公共重置：本轮还没吐字，窗口与计数都归零。 */
+	const beginRequest = (): void => {
+		requestStartAt = 0;
+		firstDeltaAt = 0;
+		streamChars = 0;
+		streaming = false;
+	};
 
 	cmd.on('model_request_start', event => {
+		if (subagentDepth > 0) return;
 		if (typeof event.model === 'string' && event.model) model = event.model;
-		// 子代理内部也会发这些事件，主上下文的速度窗口不能被它打断。
-		if (subagentDepth === 0) {
-			requestStartAt = Date.now();
-			streamStartAt = undefined;
-			lastDeltaAt = undefined;
-			streamChars = 0;
-		}
+		beginRequest();
+		// 回退口径（请求总时长）的起点；纯生成口径的首个 delta 会在 text/thinking_delta 里补上。
+		requestStartAt = Date.now();
 		paint();
+	});
+
+	// 文本与思考增量都算：它们都是模型吐出来的输出 token。
+	cmd.on('text_delta', event => {
+		if (subagentDepth > 0) return;
+		noteDelta(event.delta);
+		if (!streaming && firstDeltaAt > 0) {
+			streaming = true;
+			startStreamTicker();
+		}
+	});
+
+	cmd.on('thinking_delta', event => {
+		if (subagentDepth > 0) return;
+		noteDelta(event.delta);
+		if (!streaming && firstDeltaAt > 0) {
+			streaming = true;
+			startStreamTicker();
+		}
 	});
 
 	cmd.on('model_request_end', event => {
@@ -402,13 +444,9 @@ export default function contextUsageMod(cmd: ModApi): void {
 		sessionOutput += output;
 		sessionCacheRead += usage?.cacheReadTokens ?? 0;
 		sessionCacheWrite += usage?.cacheWriteTokens ?? 0;
-		// 速度要用刚才那个生成窗口定稿，所以必须在清空窗口之前算。
-		speed = settledSpeed(output, Date.now()) ?? speed;
-		requestStartAt = undefined;
-		streamStartAt = undefined;
-		lastDeltaAt = undefined;
-		streamChars = 0;
-		syncTicker();
+		// 用真实的 outputTokens 与自测的生成窗口结算速率（事件本身不带耗时）。
+		finishRequest(output, Date.now());
+		stopStreamTicker();
 		paint();
 	});
 
@@ -420,6 +458,15 @@ export default function contextUsageMod(cmd: ModApi): void {
 		subagentDepth = Math.max(0, subagentDepth - 1);
 	});
 
+	// 请求中断（abort / 网络错误）时 model_request_end **不会**发出——它在 CLI 的显式
+	// try 里，异常会直接 break 出循环。所以流式定时器必须在 run 结束时兜底停掉，
+	// 否则它每秒钟继续重绘，而且估算会因为「字符不再增长、时间继续流逝」而越算越小。
+	// 注意只停流式那个：压缩时长的 ticker 本就该跨 run 持续刷新「⟳ 3m」。
+	cmd.on('run_end', () => {
+		beginRequest();
+		stopStreamTicker();
+	});
+
 	cmd.on('session_start', () => {
 		used = 0;
 		sessionInput = 0;
@@ -429,12 +476,11 @@ export default function contextUsageMod(cmd: ModApi): void {
 		subagentDepth = 0;
 		compactionAt = undefined;
 		compactionSaved = 0;
+		beginRequest();
 		speed = undefined;
-		requestStartAt = undefined;
-		streamStartAt = undefined;
-		lastDeltaAt = undefined;
-		streamChars = 0;
+		calibrated = undefined;
 		stopTicker();
+		stopStreamTicker();
 		paint();
 	});
 
@@ -446,7 +492,7 @@ export default function contextUsageMod(cmd: ModApi): void {
 		compactionAt = Date.now();
 		compactionSaved = typeof event.tokensSaved === 'number' ? event.tokensSaved : 0;
 		if (compactionSaved > 0) used = Math.max(0, used - compactionSaved);
-		syncTicker();
+		startTicker();
 		paint();
 	});
 

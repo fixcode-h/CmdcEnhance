@@ -377,144 +377,214 @@ describe('contextUsageMod 的速度段接线', () => {
 		vi.useRealTimers();
 	});
 
-	it('首次请求前不显示速度', () => {
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		expect(cmd.last()).not.toContain('⚡');
-	});
-
-	it('流式中按 delta 估算并标 ~，随 ticker 每秒刷新', () => {
+	// 事件不带耗时，速率只能靠 delta/end 的时间点自己量。
+	// 用假定时器统一推进：vitest 的 fake timers 同时接管 Date，时间与定时器一起走，
+	// 不会出现两个时钟漂移。
+	function withClock() {
 		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		cmd.emit('text_delta', {delta: 'x'.repeat(400)}); // 400 字符 ≈ 100 token
-		vi.advanceTimersByTime(1000);
-		expect(cmd.last()).toContain('⚡ ~100 tok/s');
-		vi.advanceTimersByTime(1000);
-		expect(cmd.last()).toContain('⚡ ~50 tok/s');
-	});
+		return {advance: (ms: number): void => void vi.advanceTimersByTime(ms)};
+	}
 
-	it('思考增量同样计入', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
+	/** 跑一轮完整请求：开窗口、吐 chars 个字符、等 genMs、结算。 */
+	function runRound(
+		cmd: ReturnType<typeof fakeCmd>,
+		options: {chars: number; genMs: number; outputTokens: number; thinking?: boolean},
+	): void {
 		cmd.emit('model_request_start', {model: 'm'});
-		cmd.emit('thinking_delta', {delta: 'x'.repeat(800)}); // 800 字符 ≈ 200 token
-		vi.advanceTimersByTime(2000);
-		expect(cmd.last()).toContain('⚡ ~100 tok/s');
-	});
-
-	it('定稿用真实 outputTokens，分母是生成窗口、不含首字延迟', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		vi.advanceTimersByTime(3000); // 首字延迟 3s
-		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
-		vi.advanceTimersByTime(2000); // 生成 2s
-		cmd.emit('text_delta', {delta: 'y'.repeat(400)});
-		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 200}});
-		// 摊进首字延迟会得到 200/5s = 40；生成窗口算出来才是 100
-		expect(cmd.last()).toContain('⚡ 100 tok/s');
-		expect(cmd.last()).not.toContain('~');
-	});
-
-	it('收不到 delta 时退回整次请求的时长', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		vi.advanceTimersByTime(4000);
-		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 200}});
-		expect(cmd.last()).toContain('⚡ 50 tok/s');
-	});
-
-	it('窗口太短时先不显示，避免数字乱跳', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
-		expect(cmd.last()).not.toContain('⚡');
-	});
-
-	it('空闲时保留上一轮的定稿值', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		vi.advanceTimersByTime(3000);
-		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 150}});
-		expect(cmd.last()).toContain('⚡ 50 tok/s');
-		cmd.emit('model_request_start', {model: 'm'});
-		expect(cmd.last()).toContain('⚡ 50 tok/s');
-	});
-
-	it('该轮没有输出时保留上一轮的值', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		vi.advanceTimersByTime(2000);
-		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 100}});
-		expect(cmd.last()).toContain('⚡ 50 tok/s');
-		cmd.emit('model_request_start', {model: 'm'});
-		vi.advanceTimersByTime(2000);
-		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 0}});
-		expect(cmd.last()).toContain('⚡ 50 tok/s');
-	});
-
-	it('子代理的流式增量不污染主上下文的速度', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
-		cmd.emit('subagent_start');
-		cmd.emit('text_delta', {delta: 'y'.repeat(4000)}); // 若被计入会显示成 ~550 tok/s
-		cmd.emit('subagent_stop');
-		vi.advanceTimersByTime(2000);
-		expect(cmd.last()).toContain('⚡ ~50 tok/s');
-	});
-
-	it('session_start 清掉速度', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		vi.advanceTimersByTime(2000);
-		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 100}});
-		expect(cmd.last()).toContain('⚡');
-		cmd.emit('session_start');
-		expect(cmd.last()).not.toContain('⚡');
-	});
-
-	it('流式结束后停掉每秒重绘', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
-		vi.advanceTimersByTime(2000);
-		cmd.emit('model_request_end', {model: 'm', usage: {outputTokens: 100}});
-		const before = cmd.frames.length;
-		vi.advanceTimersByTime(5000);
-		expect(cmd.frames).toHaveLength(before);
-	});
-
-	it('速度段排在会话累计之后、缓存之前', () => {
-		vi.useFakeTimers();
-		const cmd = fakeCmd({contextWindow: '1000000'});
-		contextUsageMod(cmd as never);
-		cmd.emit('model_request_start', {model: 'm'});
-		cmd.emit('text_delta', {delta: 'x'.repeat(400)});
-		vi.advanceTimersByTime(2000);
+		cmd.emit(options.thinking ? 'thinking_delta' : 'text_delta', {
+			delta: 'a'.repeat(options.chars),
+		});
+		vi.advanceTimersByTime(options.genMs);
 		cmd.emit('model_request_end', {
 			model: 'm',
-			usage: {inputTokens: 20_000, cacheReadTokens: 18_000, outputTokens: 100},
+			usage: {inputTokens: 10_000, outputTokens: options.outputTokens},
 		});
-		expect(cmd.last().indexOf('↓')).toBeLessThan(cmd.last().indexOf('⚡'));
-		expect(cmd.last().indexOf('⚡')).toBeLessThan(cmd.last().indexOf('cache'));
+	}
+
+	it('结算速率 = 真实 outputTokens ÷ 自测的生成窗口', () => {
+		withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		// 900 token / 1000ms = 900 tok/s
+		runRound(cmd, {chars: 900, genMs: 1000, outputTokens: 900});
+		expect(cmd.last()).toContain('900 tok/s');
+	});
+
+	it('首轮没有标定值，流式期间不估算（宁可暂不出数）', () => {
+		withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'a'.repeat(600)});
+		// 还没有任何历史可标定「字符/token」→ 不猜，暂不出数（哪怕已经收了不少字符）。
+		vi.advanceTimersByTime(2000);
+		expect(cmd.last()).not.toContain('tok/s');
+
+		// 本轮结束：真实值照样出得来（250 token / 2000ms = 125 tok/s）。
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000, outputTokens: 250}});
+		expect(cmd.last()).toContain('125 tok/s');
+	});
+
+	// 真机教训：某模型实测 471 字符 / 520 token（0.9 字符/token），拿固定估值 3 去算
+	// 会低估 3 倍以上（49 对 381）。所以标定必须来自上一轮的真实数据。
+	it('第二轮起用上一轮标定值做实时估算', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		// 第 1 轮：800 字符 / 800 token，窗口 1600ms → 标定 1 字符/token，结算 500 tok/s
+		runRound(cmd, {chars: 800, genMs: 1600, outputTokens: 800});
+		expect(cmd.last()).toContain('500 tok/s');
+
+		// 第 2 轮：800 字符、窗口 1000ms → 按标定 1.0 估得 800 token / 1s = 800 tok/s
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'a'.repeat(800)});
+		advance(1000);
+		expect(cmd.last()).toContain('800 tok/s');
+	});
+
+	it('实时估算的窗口太短时，computeSpeed 会把它挡掉', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		runRound(cmd, {chars: 1000, genMs: 2000, outputTokens: 1000});
+		expect(cmd.last()).toContain('500 tok/s');
+
+		// 第 2 轮刚开始吐字：窗口只有 50ms，估算会被 MIN_GEN_MS 挡掉，沿用上一轮的值。
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'a'.repeat(60)});
+		advance(50);
+		expect(cmd.last()).toContain('500 tok/s');
+		expect(cmd.last()).not.toContain('NaN');
+	});
+
+	it('思考增量也算生成（它同样是模型吐出的 token）', () => {
+		withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		// 字符数只来自 thinking_delta，仍应正常标定并结算。
+		runRound(cmd, {chars: 1000, genMs: 2000, outputTokens: 1000, thinking: true});
+		expect(cmd.last()).toContain('500 tok/s');
+	});
+
+	it('本轮结束后速率保留，直到下一轮重置', () => {
+		withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		runRound(cmd, {chars: 900, genMs: 1000, outputTokens: 900});
+		expect(cmd.last()).toContain('900 tok/s');
+		cmd.emit('model_request_start', {model: 'm'});
+		expect(cmd.last()).toContain('900 tok/s');
+	});
+
+	it('子代理的增量与请求都不影响主速率', () => {
+		withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		runRound(cmd, {chars: 900, genMs: 1000, outputTokens: 900});
+
+		cmd.emit('subagent_start');
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'b'.repeat(9000)});
+		vi.advanceTimersByTime(1000);
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 90_000, outputTokens: 9000},
+		});
+		cmd.emit('subagent_stop');
+		expect(cmd.last()).toContain('900 tok/s');
+	});
+
+	it('缺 outputTokens 时不结算，也不产生 NaN', () => {
+		withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'a'.repeat(900)});
+		vi.advanceTimersByTime(1000);
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000}});
+		expect(cmd.last()).not.toContain('tok/s');
+		expect(cmd.last()).not.toContain('NaN');
+	});
+
+	// 中断（abort / 网络错误）时 model_request_end 不会发出，流式定时器必须在 run_end 兜底停掉，
+	// 否则它会一直重绘，且估算值随「字符不再增长、时间继续流逝」越算越小。
+	it('run_end 兜底停掉流式刷新，估算值不再继续下滑', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		// 先有一轮真实数据，建立标定值。
+		runRound(cmd, {chars: 800, genMs: 1600, outputTokens: 800});
+
+		// 第二轮开始流式，中途被中断：没有 model_request_end。
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'a'.repeat(800)});
+		advance(1000);
+		expect(cmd.last()).toContain('800 tok/s');
+		cmd.emit('run_end');
+		const afterRunEnd = cmd.frames.length;
+		// 定时器已停：再推进 5 秒也不会产生新帧（否则估算会一路掉下去）。
+		advance(5000);
+		expect(cmd.frames).toHaveLength(afterRunEnd);
+		expect(cmd.last()).toContain('800 tok/s');
+	});
+
+	it('session_start 清掉速率与标定值', () => {
+		withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		runRound(cmd, {chars: 900, genMs: 1000, outputTokens: 900});
+		expect(cmd.last()).toContain('tok/s');
+		cmd.emit('session_start');
+		expect(cmd.last()).not.toContain('tok/s');
+
+		// 标定也被清掉：新一轮流式期间不该出现估算值。
+		cmd.emit('model_request_start', {model: 'm'});
+		cmd.emit('text_delta', {delta: 'a'.repeat(900)});
+		vi.advanceTimersByTime(2000);
+		expect(cmd.last()).not.toContain('tok/s');
+	});
+
+	// 探针实测：有的 provider 在工具轮把 delta 成簇压到请求末尾投递——genWindow 只有
+	// 3~6ms（首个 delta 距请求结束仅 3~6ms），窗口外却仍有上百 token 输出。纯生成口径
+	// 被 MIN_GEN_MS 挡掉时不能再干等，否则 cmdc 里最常见的工具轮永远没有速率。
+	it('delta 成簇压到请求末尾时，回退到请求总时长口径', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		advance(6000); // TTFT：请求发出 6s 后才吐出这簇 delta
+		cmd.emit('text_delta', {delta: 'a'.repeat(50)});
+		advance(6); // 生成窗口只有 6ms，纯生成口径会被挡掉
+		cmd.emit('model_request_end', {
+			model: 'm',
+			usage: {inputTokens: 10_000, outputTokens: 300},
+		});
+		// 回退口径：300 token ÷ 6006ms ≈ 50 tok/s（含 TTFT，偏保守但出得来数）。
+		expect(cmd.last()).toContain('50 tok/s');
+	});
+
+	// 整轮一个 delta 都没有（全走 tool input 的 JSON）时同样回退，而不是没有速率。
+	it('整轮没有任何 delta 时也回退到请求总时长', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		advance(4000);
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000, outputTokens: 200}});
+		expect(cmd.last()).toContain('50 tok/s');
+	});
+
+	// 纯生成窗口有效时必须优先用它——回退口径含 TTFT，数字明显偏小，不能反过来盖掉。
+	it('纯生成窗口有效时不回退到总时长（不被偏小的值覆盖）', () => {
+		const {advance} = withClock();
+		const cmd = fakeCmd();
+		contextUsageMod(cmd as never);
+		cmd.emit('model_request_start', {model: 'm'});
+		advance(5000); // 长 TTFT，回退口径会算出 900/6000 = 150
+		cmd.emit('text_delta', {delta: 'a'.repeat(900)});
+		advance(1000); // 纯生成窗口 1000ms → 900 tok/s
+		cmd.emit('model_request_end', {model: 'm', usage: {inputTokens: 10_000, outputTokens: 900}});
+		expect(cmd.last()).toContain('900 tok/s');
+		expect(cmd.last()).not.toContain('150 tok/s');
 	});
 });

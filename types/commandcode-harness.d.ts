@@ -37,6 +37,8 @@ declare module '@commandcode/harness' {
 		readonly totalTokensSaved?: number;
 		/** `compaction_done`：`manual` 表示 `/compact` 触发。 */
 		readonly trigger?: string;
+		/** `text_delta` / `thinking_delta`：本次增量文本。用来计生成速率。 */
+		readonly delta?: string;
 		readonly [key: string]: unknown;
 	}
 

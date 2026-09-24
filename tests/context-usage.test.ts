@@ -10,12 +10,12 @@ import {
 import {
 	barWidthFor,
 	buildBar,
-	estimateStreamTokens,
+	calibrateCharsPerToken,
+	computeSpeed,
 	formatDuration,
 	formatSpeed,
 	formatTokens,
 	renderStatus,
-	tokensPerSecond,
 } from '../mods/context-usage';
 
 const RED = '\u001b[31m';
@@ -265,84 +265,78 @@ describe('renderStatus 的会话累计段', () => {
 	});
 });
 
-describe('estimateStreamTokens', () => {
-	// 与 CLI 内部 estimateTokens2（Math.ceil(len / 4)）同口径，改这里等于和 CLI 的口径分家。
-	it('字符数 ÷ 4 向上取整', () => {
-		expect(estimateStreamTokens(4)).toBe(1);
-		expect(estimateStreamTokens(5)).toBe(2);
-		expect(estimateStreamTokens(400)).toBe(100);
+describe('computeSpeed', () => {
+	it('用真实 outputTokens ÷ 生成窗口算速率', () => {
+		// 真机实测：867 token / 2307ms ≈ 376 tok/s
+		expect(computeSpeed(867, 2307)).toBeCloseTo(375.8, 1);
 	});
 
-	it('非正与非法值给 0', () => {
-		expect(estimateStreamTokens(0)).toBe(0);
-		expect(estimateStreamTokens(-4)).toBe(0);
-		expect(estimateStreamTokens(Number.NaN)).toBe(0);
+	it('输出为 0 或非法时不显示（避免 ∞ / NaN）', () => {
+		expect(computeSpeed(0, 1000)).toBeUndefined();
+		expect(computeSpeed(-5, 1000)).toBeUndefined();
+		expect(computeSpeed(Number.NaN, 1000)).toBeUndefined();
+	});
+
+	// 实测教训：delta 成簇投递，簇与簇之间可能只隔几毫秒，窗口太短时商是计时噪声。
+	it('生成窗口短于下限时不显示', () => {
+		expect(computeSpeed(10, 199)).toBeUndefined();
+		expect(computeSpeed(10, 200)).toBeCloseTo(50, 5);
+		expect(computeSpeed(10, Number.NaN)).toBeUndefined();
+	});
+});
+
+describe('calibrateCharsPerToken', () => {
+	it('用上一轮的字符数与真实 token 数标定', () => {
+		// 真机实测：2387 字符 / 867 token ≈ 2.75
+		expect(calibrateCharsPerToken(867, 2387)).toBeCloseTo(2.75, 2);
+	});
+
+	it('夹到 [1, 6]，挡住中文与异常值', () => {
+		// 中文约 1 字符/token，极端重复内容会超过 6
+		expect(calibrateCharsPerToken(1000, 100)).toBe(1);
+		expect(calibrateCharsPerToken(100, 5000)).toBe(6);
+	});
+
+	it('缺数据时不标定，让调用方回落估值', () => {
+		expect(calibrateCharsPerToken(0, 100)).toBeUndefined();
+		expect(calibrateCharsPerToken(100, 0)).toBeUndefined();
+		expect(calibrateCharsPerToken(Number.NaN, 100)).toBeUndefined();
 	});
 });
 
 describe('formatSpeed', () => {
-	it('百以下保留一位小数并去尾零', () => {
-		expect(formatSpeed(48.23)).toBe('48.2');
-		expect(formatSpeed(50)).toBe('50');
-		expect(formatSpeed(0.44)).toBe('0.4');
+	it('取整并带单位', () => {
+		expect(formatSpeed(376)).toBe('376 tok/s');
+		expect(formatSpeed(86.4)).toBe('86 tok/s');
 	});
 
-	it('百以上取整', () => {
-		expect(formatSpeed(100)).toBe('100');
-		expect(formatSpeed(128.6)).toBe('129');
+	it('千级以上切成 k', () => {
+		expect(formatSpeed(1200)).toBe('1.2k tok/s');
+		expect(formatSpeed(1000)).toBe('1k tok/s');
 	});
 
-	it('非正与非法值给 0', () => {
-		expect(formatSpeed(0)).toBe('0');
-		expect(formatSpeed(-1)).toBe('0');
-		expect(formatSpeed(Number.NaN)).toBe('0');
-		expect(formatSpeed(Number.POSITIVE_INFINITY)).toBe('0');
-	});
-});
-
-describe('tokensPerSecond', () => {
-	it('token 数 ÷ 秒数', () => {
-		expect(tokensPerSecond(100, 2000)).toBe(50);
-		expect(tokensPerSecond(300, 60_000)).toBe(5);
-	});
-
-	it('耗时为 0 或负数时返回 0，不除零', () => {
-		expect(tokensPerSecond(100, 0)).toBe(0);
-		expect(tokensPerSecond(100, -1)).toBe(0);
-	});
-
-	it('token 数为 0 或非法时返回 0', () => {
-		expect(tokensPerSecond(0, 1000)).toBe(0);
-		expect(tokensPerSecond(Number.NaN, 1000)).toBe(0);
+	it('非正数与非法值给空串（调用方据此不渲染）', () => {
+		expect(formatSpeed(0)).toBe('');
+		expect(formatSpeed(-1)).toBe('');
+		expect(formatSpeed(Number.NaN)).toBe('');
 	});
 });
 
 describe('renderStatus 的速度段', () => {
 	const base = {used: 50_000, limit: 100_000, estimated: false, columns: 120};
 
-	it('显示成 ⚡ <n> tok/s', () => {
-		const text = renderStatus({...base, speed: {tps: 52.7, estimated: false}});
-		expect(text).toContain('⚡ 52.7 tok/s');
+	it('显示 tok/s', () => {
+		expect(renderStatus({...base, speed: 376})).toContain('376 tok/s');
 	});
 
-	it('流式中的估算值加 ~ 前缀', () => {
-		const text = renderStatus({...base, speed: {tps: 48.2, estimated: true}});
-		expect(text).toContain('⚡ ~48.2 tok/s');
+	it('没有速度时不追加', () => {
+		expect(renderStatus(base)).not.toContain('tok/s');
 	});
 
-	it('没有速度信息时不追加', () => {
-		expect(renderStatus(base)).not.toContain('⚡');
-	});
-
-	it('排在会话累计之后、缓存之前', () => {
-		const text = renderStatus({
-			...base,
-			session: {input: 1_200_000, output: 45_000},
-			speed: {tps: 50, estimated: false},
-			cache: {hitRate: 0.9, written: 0},
-		});
-		expect(text.indexOf('↑')).toBeLessThan(text.indexOf('⚡'));
-		expect(text.indexOf('⚡')).toBeLessThan(text.indexOf('cache'));
+	it('排在 used/limit 之后、会话累计之前（同属「此刻」读数）', () => {
+		const text = renderStatus({...base, speed: 376, session: {input: 1_200_000, output: 45_000}});
+		expect(text.indexOf('50k/100k')).toBeLessThan(text.indexOf('tok/s'));
+		expect(text.indexOf('tok/s')).toBeLessThan(text.indexOf('↑'));
 	});
 });
 
