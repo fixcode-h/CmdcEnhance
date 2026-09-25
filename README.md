@@ -36,14 +36,14 @@ types/     @commandcode/harness 的最小类型声明
 
 ```
 ctx ██████████████████░░ 90% 900k/1M
-ctx ██████████████████░░ 90% 900k/1M · 376 tok/s
-ctx ██████████████████░░ 90% 900k/1M · 376 tok/s · ↑3.6M ↓42k · cache 89.00% +12k · ⟳ 3m -30k
+ctx ██████████████████░░ 90% 900k/1M · 376.0 tok/s
+ctx ██████████████████░░ 90% 900k/1M · 376.0 tok/s · ↑3.6M ↓42k · cache 89.00% +12k · ⟳ 3m -30k
 ```
 
 - **上限从哪来**（按优先级）：`--mod-option contextWindow=<token 数>` → `~/.commandcode/providers.json`（BYOK 的 `contextWindow`）→ `~/.commandcode/cache/models-dev.json` 目录 → 兜底 `200000`。走兜底时数字前面加 `~`，表示这是猜的。
 - **模型从哪来**：`model_request_start` / `model_request_end` 事件。启动到第一次请求之间是事件静默期，此时用 `~/.commandcode/config.json` 的 `model` 兜底解析，否则首屏只能显示兜底的 `~200k`。
 - **占用口径** = `inputTokens + outputTokens`。CLI 的 `inputTokens` 已是整段 prompt 的总数（`cacheReadTokens` 是它的子集明细，不能相加）。
-- **生成速率**（`376 tok/s`）= **最近一轮**的 `outputTokens ÷ 自测的生成窗口`，与左边的 `900k/1M` 一样属「此刻」读数（`session_start` 清空）。**注意它和端到端速率不是一回事**，见下节。
+- **生成速率**（`376.0 tok/s`）= **最近一轮**的 `outputTokens ÷ 纯生成窗口`，对齐 DeepSeek Harness（dsh）的 `throughput` 口径。与左边的 `900k/1M` 一样属「此刻」读数（`session_start` 清空）。**注意它和端到端速率不是一回事**，见下节。
 - **会话累计** `↑输入 ↓输出` = 本会话每轮请求的 `inputTokens` / `outputTokens` 之和，`session_start` 清零，只算主上下文、不含子代理。**注意它和左边的 `900k/1M` 不是一回事**：`900k/1M` 是当前上下文长度（快照），`↑3.6M` 是「一共处理了多少 token」——每轮都会把整段 prompt 重发一遍，所以它会随轮次快速增长。首次请求前不显示。
 - **缓存段** = 会话累计命中率 `ΣcacheReadTokens / ΣinputTokens`，同样 `session_start` 清零。`+12k` 是会话累计写入缓存的量，只在本会话写过时才出现。**本会话从未有过缓存活动时整段不显示**——不支持 prompt 缓存的 provider 不该常驻一个 `cache 0.00%` 噪音。
 - 子代理的请求也走 `model_request_end`，靠 `subagent_start` / `subagent_stop` 的深度计数挡掉，避免进度条跳到子上下文长度。
@@ -51,31 +51,38 @@ ctx ██████████████████░░ 90% 900k/1M · 
 - **压缩摘要**：`compaction_done` 后往末尾追加 `· ⟳ <距现在多久> [-<省下的 token>]`，靠一个 unref 的 1s 定时器把时长刷新出来（事件没带 `tokensSaved` 时省略省下的部分），`session_start` 清空。
 - **压缩后进度条立即回落**：事件只带 `tokensSaved`、**不带压缩后的真实用量**，所以那一刻直接用 `used - tokensSaved` 把占用扣下去——右侧数字立刻变小，不用等下一轮请求。这是估算值，**下一轮 `model_request_end` 会用真实 `usage` 覆盖它**（所以压缩后数字可能先跳一下再定）。
 
-#### 生成速率的口径陷阱（实测）
+#### 生成速率：对齐 dsh 口径（`outputTokens ÷ 纯生成窗口`）
 
-- **事件不带任何耗时**。`model_request_end` 的 payload 只有 `{model, usage, stopReason, effort}`——没有 duration、没有 ttft、没有 timestamp，CLI 里也搜不到任何 `tok/s` 实现。所以时间只能自己量：拿**首个 delta** 与 `model_request_end` 的墙钟差当生成窗口。
-- **delta 是成簇投递的，不能算瞬时速率**。实测一轮 477 个 delta 只落在 **18 个**不同时间戳上，同一簇内时间差是 0——照簇算会得到 `∞ tok/s`。所以只算窗口平均值，且窗口短于 200ms 时不再相信它（那点差值是计时噪声），改用下面的回退口径。
-- **口径选错会差 3 倍以上**。同一轮真机数据：总耗时 7438ms、首 token 出现在 5131ms、真实 `outputTokens` 867。
+口径取自 DeepSeek Harness 的 Trajectory 记录检查器（`packages/client/ui-trajectory/src/client/TrajectoryTable.tsx`）：
+
+```ts
+const generationSeconds = (completedTime - firstTokenTime) / 1000
+value: (outputTokens / generationSeconds).toFixed(1)   // → `{value} tok/s`
+```
+
+本 mod 用同一个公式、同一位小数精度（`376.0 tok/s`）。**区别只在数据源**：dsh 自己把每个 chunk 和它的会话时间戳以差分编码写进 durable 事件（`AssistantStreamAccumulator`），所以它能精确重算历史轮次的时序；而 cmdc 的事件**不带任何耗时**——`model_request_end` 的 payload 只有 `{model, usage, stopReason, effort}`，没有 duration、没有 ttft、没有 timestamp。所以这里的时间仍然只能自测：拿**首个 delta** 与 `model_request_end` 的墙钟差当纯生成窗口。
+
+- **只算纯生成，不含 TTFT。** 同一轮真机数据：总耗时 7438ms、首 token 出现在 5131ms、真实 `outputTokens` 867。
 
   | 口径 | 算式 | 结果 |
   |---|---|---|
   | 端到端 | 867 ÷ 7438ms | **117 tok/s** |
-  | 纯生成 | 867 ÷ (7438−5131)ms | **376 tok/s** |
+  | 纯生成（本 mod 与 dsh） | 867 ÷ (7438−5131)ms | **376 tok/s** |
 
-  本 mod **首选纯生成**口径——它回答「模型吐字多快」，端到端那个更多是在量 TTFT。
+  纯生成口径回答「模型吐字多快」，端到端那个更多是在量 TTFT。dsh 也只这么算。
 
-- **delta 成簇压到请求末尾时，回退到端到端口径**（探针实测）。有的 provider/模型在**工具轮**并不是边生成边投递 delta，而是把整轮的 delta 攒到请求结束前一次性投递：实测同一个模型
+- **delta 成簇投递，窗口太短就不出数（宁可不显示，也不给噪声数）**。实测一轮 477 个 delta 只落在 **18 个**不同时间戳上，簇内时间差为 0，照簇算会得到 `∞ tok/s`；有的 provider 在**工具轮**更极端，把整轮的 delta 攒到请求结束前一次性投递，纯生成窗口只有 3~6ms。所以只算窗口平均值、绝不算瞬时值，且窗口短于 `MIN_GEN_MS`（200ms）一律判为「量不到」：
 
-  | 轮次性质 | `genWindow`（首个 delta 距请求结束） | 纯生成口径 | 是否出数 |
-  |---|---|---|---|
-  | 纯文本轮（271 delta 跨 936ms） | 936ms | 386 tok/s | ✅ |
-  | 工具轮 | **3~6ms** | 被 `MIN_GEN_MS` 挡掉 | ❌ → 回退 |
+  | 轮次性质 | `genWindow`（首个 delta 距请求结束） | 结果 |
+  |---|---|---|
+  | 纯文本轮（271 delta 跨 936ms） | 936ms | ✅ 出数 |
+  | 工具轮 | **3~6ms** | ❌ 不出数 |
 
-  工具轮在 cmdc 里是**常态**（模型几乎每轮都要调工具），如果此时不出数，状态栏就会长期没有速率。所以纯生成窗口被挡掉时改用**请求总时长**（`end − start`）口径结算：它含 TTFT、数字偏保守（实测该模型 TTFT 长达 9s，同样的 88 token 会显示 `10 tok/s`），但任何轮次都出得来数。整轮一个 delta 都没有（输出全走 tool input 的 JSON）时同样走这条回退。
+  **这是刻意的取舍，代价是工具轮常驻没有速率。** 那种窗口全是计时噪声，用它除只会得到一个由投递时机决定、而非模型速度决定的数；dsh 在 `generationSeconds <= 0`（`时长过短`）时同样留空。整轮一个 delta 都没有（输出全走 tool input 的 JSON）时同理不出数。
+  > 历史做法：早期版本在窗口被挡掉时**回退到请求总时长**口径（`end − start`），靠它让工具轮也能出数。但那含 TTFT、数字明显偏小（实测该模型 TTFT 长达 9s，同样的 88 token 会显示 `10 tok/s`），且与 dsh 不同式，已删除。
 
-- **流式期间的估算是「用上一轮的尺子量本轮」**。生成中只数得到字符、拿不到 token 数，所以用上一轮的 `字符数 ÷ outputTokens` 标定「字符/token」再换算。**首轮没有标定值就不估算**：初值只能靠猜，而实测同一模型能偏离估值 3 倍以上（真机某轮 471 字符 / 520 token，即 0.9 字符/token，固定估值 3 会算出 49 而真实是 381）——错得比不显示更糟。
-- **中断时靠 `run_end` 兜底**。请求被 abort / 网络错误时 `model_request_end` 不会发出（它在 CLI 的 `try` 里，异常直接 break），流式定时器必须在这里停掉，否则会一直重绘、估算值越算越小。
-- 流式估算每秒刷新一次（复用状态栏的 1s 定时器）；**不能挂在 delta 上重绘**——实测一轮 477 个 delta，那会变成每秒几百次 `setStatus`。
+- **不做流式估算。** dsh 靠真时间戳逐 token 前进，cmdc 拿不到流式 token 数、只能靠猜（初值可能偏 3 倍以上：真机某轮 471 字符 / 520 token）。旧版本用「上一轮字符/token」标定后估算，现按 dsh 的取舍一并删除——本轮只在本轮结算后出数。
+- **中断时靠 `run_end` 作废窗口**。请求被 abort / 网络错误时 `model_request_end` 不会发出（它在 CLI 的 `try` 里，异常直接 break），此时把本轮的生成窗口清掉，避免下一轮结算拿一个跨了中断期的陈旧起点当窗口。
 
 #### 为什么缓存用「会话累计」而不是「最近一次」（实测）
 
