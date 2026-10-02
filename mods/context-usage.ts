@@ -4,7 +4,6 @@
 //  - 输入框附近唯一真正渲染的挂点是 ui.setStatus。ui.widget 目前是空壳，不渲染任何东西。
 //  - 没有任何 API 能读到「当前模型」或「上下文上限」。模型只能从 model_request_* 事件里抓；
 //    上限由 lib/model-catalog 解析：--mod-option → providers.json → models.dev 缓存 → 兜底 200k。
-//    （context-slim 用同一个模块，两处必须得出同一个上限。）
 //
 // 占用口径 = inputTokens + outputTokens。CLI 的 inputTokens 已是整段 prompt 的总数
 // （cacheReadTokens 只是它的子集明细，不能相加），outputTokens 下一轮会进入 prompt。

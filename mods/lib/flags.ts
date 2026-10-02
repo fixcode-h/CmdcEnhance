@@ -1,7 +1,6 @@
 // mod 开关的统一口径。
 //
-// `--mod-option` 是全局命名空间，flag 名一律带 mod 前缀（outputFold / inputShortcuts /
-// contextSlim …），避免不同 mod 撞名。
+// `--mod-option` 是全局命名空间，flag 名一律带 mod 前缀，避免不同 mod 撞名。
 //
 // 读值的两条纪律：
 //  - **默认开启**时判定写 `!== false` 是不够的：`--mod-option x=0` 会被 CLI 按 boolean
@@ -23,25 +22,4 @@ export function flagEnabled(cmd: FlagReader, name: string, fallback = true): boo
 	const text = value.trim().toLowerCase();
 	if (!text) return fallback;
 	return !FALSEY.has(text);
-}
-
-/** 正整数 flag（阈值类）；非法值回落 `fallback`。 */
-export function flagPositiveInt(cmd: FlagReader, name: string, fallback: number): number {
-	const value = cmd.getFlag(name);
-	if (value === undefined || value === null || typeof value === 'boolean') return fallback;
-	const parsed = Number(value.trim());
-	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
-}
-
-/**
- * 逗号分隔列表 flag。**未设置**才回落 `fallback`；显式传空串表示「列表为空」，
- * 这样 `--mod-option outputFoldSkip=` 能真的关掉整张排除表。
- */
-export function flagList(cmd: FlagReader, name: string, fallback: readonly string[]): string[] {
-	const value = cmd.getFlag(name);
-	if (value === undefined || value === null || typeof value === 'boolean') return [...fallback];
-	return value
-		.split(',')
-		.map(part => part.trim())
-		.filter(Boolean);
 }
